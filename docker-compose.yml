@@ -1,0 +1,23 @@
+name: aider-benchmark
+
+services:
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./results:/results
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OPENAI_API_KEY=sk-dummy
+      - OPENAI_API_BASE=${LLAMA_BASE_URL:-http://100.71.29.121:3002/v1}
+      - AIDER_DOCKER=1
+      - AIDER_BENCHMARK_DIR=/benchmarks
+    working_dir: /aider
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    tty: true
+    stdin_open: true
+    # Default: open a shell for interactive use
+    # Override with: docker compose run benchmark ./benchmark/benchmark.py ...
+    command: bash
