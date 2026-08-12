@@ -49,6 +49,23 @@ REASONING_EFFORT="${REASONING_EFFORT-low}"  # empty string disables
 EDIT_FORMAT="${EDIT_FORMAT:-whole}"         # whole|diff|udiff|... forwarded as aider's --edit-format
                                              # (applies to smoke/quick/python/polyglot/full/custom;
                                              # the dedicated `diff` command always forces diff, that's its purpose)
+
+# Fail fast with a clear message instead of a cryptic UnknownEditFormat
+# traceback from deep inside the container 30+ seconds into a run. Full list
+# from aider/coders/base_coder.py; only whole/diff/diff-fenced/patch/udiff/
+# udiff-simple make sense for benchmarking (architect/editor-*/ask/help are
+# chat-mode or architect-internal formats, not something you'd pick here).
+_VALID_EDIT_FORMATS="help ask diff diff-fenced whole patch udiff udiff-simple architect editor-diff editor-whole editor-diff-fenced context"
+case " $_VALID_EDIT_FORMATS " in
+  *" $EDIT_FORMAT "*) ;;
+  *)
+    echo "ERROR: EDIT_FORMAT='$EDIT_FORMAT' is not a real aider edit format." >&2
+    echo "Did you mean 'whole' (aider's default, and this script's default)?" >&2
+    echo "Valid values: $_VALID_EDIT_FORMATS" >&2
+    echo "(for benchmarking, you almost always want: whole, diff, or udiff)" >&2
+    exit 1
+    ;;
+esac
 TRIES="${TRIES:-4}"                         # fix-up attempts per exercise (default 2 gave too many false negatives)
 MAX_TOKENS="${MAX_TOKENS:-16000}"           # hard cap on thinking+answer tokens
                                              # (6-8k caps truncated legitimate answers on some
@@ -79,6 +96,12 @@ RUN_START_TS="$(date +%s)"
 # change across runs (dynamic-header merge, same as bench-replay.sh).
 
 TRACK_TSV="${TRACK_TSV:-$(pwd)/results/eval-results.tsv}"
+# One row per exercise per run (language, exercise name, pass/fail, tries
+# taken, tokens, cost, ...) alongside the same run/model/server settings
+# columns as TRACK_TSV, so per-exercise questions ("did model A handle
+# zipper better than model B") are a plain filter on one file instead of
+# needing to dig through individual .aider.chat.history.md transcripts.
+PER_TEST_TSV="${PER_TEST_TSV:-$(pwd)/results/eval-results-per-test.tsv}"
 LLAMA_CONTAINER="${LLAMA_CONTAINER:-}"
 
 detect_llama_container() {
@@ -181,22 +204,39 @@ import csv, json, os, sys
 from pathlib import Path
 from datetime import datetime, timezone
 
-tsv_file, run_dir, cmd_name, model, srv_file, since_ts = sys.argv[1:7]
+tsv_file, per_test_tsv_file, run_dir, cmd_name, model, srv_file, since_ts = sys.argv[1:8]
 since_ts = float(since_ts)
 run_dir = Path(run_dir)
 aider_settings = {}
-for kv in sys.argv[7:]:
+for kv in sys.argv[8:]:
     k, _, v = kv.partition('=')
     aider_settings[k] = v
+
+# Settings shared by the aggregate row and every per-test row below: this
+# run's aider config plus the llama-server's current behavior settings (see
+# capture_srv_settings/SRV_BLACKLIST). Same dynamic grows/shrinks-across-rows
+# treatment in write_tsv() as everything else here -- not a fixed column list.
+settings = dict(aider_settings)
+if os.path.isfile(srv_file):
+    with open(srv_file) as f:
+        for line in f:
+            line = line.strip()
+            if '=' in line:
+                k, v = line.split('=', 1)
+                settings[k] = v
 
 results = []
 for fname in run_dir.glob('*/exercises/practice/*/.aider.results.json'):
     try:
         if fname.stat().st_mtime < since_ts:
             continue  # leftover from a prior run of this same command
-        results.append(json.loads(fname.read_text()))
+        data = json.loads(fname.read_text())
     except (json.JSONDecodeError, OSError):
         continue
+    rel = fname.relative_to(run_dir).parts  # (language, 'exercises', 'practice', exercise, '.aider.results.json')
+    data['_language'] = rel[0]
+    data['_exercise'] = rel[3] if len(rel) > 4 else fname.parent.name
+    results.append(data)
 
 total_tests = len(list(run_dir.glob('*/exercises/practice/*')))
 completed = 0
@@ -245,15 +285,7 @@ row = {
     'run_dir': str(run_dir),
     'model': model,
 }
-row.update(aider_settings)
-
-if os.path.isfile(srv_file):
-    with open(srv_file) as f:
-        for line in f:
-            line = line.strip()
-            if '=' in line:
-                k, v = line.split('=', 1)
-                row[k] = v
+row.update(settings)
 
 row['total_tests'] = str(total_tests)
 row['completed_tests'] = str(completed)
@@ -291,6 +323,79 @@ row['seconds_per_case'] = f'{duration / completed:.1f}' if completed else ''
 # picking one.
 row['aider_commit'] = ','.join(sorted(aider_commits))
 
+# One row per exercise: language/exercise identify the test, everything else
+# mirrors the aggregate row's fields but scoped to just that one exercise.
+per_test_rows = []
+for r in results:
+    outcomes = r.get('tests_outcomes', [])
+    passed = bool(outcomes) and outcomes[-1]
+    t_row = {
+        'timestamp': timestamp,
+        'run_cmd': cmd_name,
+        'language': r.get('_language', ''),
+        'exercise': r.get('_exercise', ''),
+        'model': model,
+    }
+    t_row.update(settings)
+    t_row['pass'] = 'true' if passed else 'false'
+    t_row['tries_taken'] = str(len(outcomes))
+    t_row['passed_at_try'] = str(len(outcomes)) if passed else ''
+    t_row['cost'] = f'{r.get(\"cost\", 0) or 0:.4f}'
+    t_row['duration'] = f'{r.get(\"duration\", 0) or 0:.1f}'
+    t_row['error_outputs'] = str(r.get('num_error_outputs', 0) or 0)
+    t_row['num_malformed_responses'] = str(r.get('num_malformed_responses', 0) or 0)
+    t_row['syntax_errors'] = str(r.get('syntax_errors', 0) or 0)
+    t_row['indentation_errors'] = str(r.get('indentation_errors', 0) or 0)
+    t_row['user_asks'] = str(r.get('num_user_asks', 0) or 0)
+    t_row['lazy_comments'] = str(r.get('lazy_comments', 0) or 0)
+    t_row['exhausted_context_windows'] = str(r.get('num_exhausted_context_windows', 0) or 0)
+    t_row['test_timeouts'] = str(r.get('test_timeouts', 0) or 0)
+    t_row['prompt_tokens'] = str(r.get('prompt_tokens', 0) or 0)
+    t_row['completion_tokens'] = str(r.get('completion_tokens', 0) or 0)
+    t_row['aider_commit'] = r.get('commit_hash', '') or ''
+    per_test_rows.append(t_row)
+
+# Shared dynamic-header TSV writer: STATIC columns first, then whatever keys
+# in new_rows aren't in static_cols/stat_cols (settings -- grows/shrinks as
+# flags change run to run), then any such columns only the *existing* file
+# had (so old rows keep their data), then the fixed STAT columns last.
+def write_tsv(tsv_file, static_cols, stat_cols, new_rows):
+    static_set, stat_set = set(static_cols), set(stat_cols)
+    existing_rows = []
+    existing_header = None
+    if os.path.isfile(tsv_file):
+        with open(tsv_file, newline='') as f:
+            reader = csv.reader(f, delimiter='\t')
+            existing_header = next(reader, None)
+            for r in reader:
+                existing_rows.append(r)
+
+    old_mid_cols = [c for c in (existing_header or []) if c not in static_set and c not in stat_set]
+    seen_mid = set(old_mid_cols)
+    new_mid_cols = []
+    for nrow in new_rows:
+        for k in nrow:
+            if k not in static_set and k not in stat_set and k not in seen_mid:
+                new_mid_cols.append(k)
+                seen_mid.add(k)
+    new_header = static_cols + new_mid_cols + old_mid_cols + stat_cols
+
+    if existing_header and existing_header != new_header:
+        rebuilt = []
+        for old_row in existing_rows:
+            old_dict = dict(zip(existing_header, old_row))
+            rebuilt.append([old_dict.get(c, '') for c in new_header])
+        existing_rows = rebuilt
+
+    os.makedirs(os.path.dirname(tsv_file) or '.', exist_ok=True)
+    with open(tsv_file, 'w', newline='') as f:
+        writer = csv.writer(f, delimiter='\t', lineterminator='\n')
+        writer.writerow(new_header)
+        for r in existing_rows:
+            writer.writerow(r)
+        for nrow in new_rows:
+            writer.writerow([nrow.get(c, '') for c in new_header])
+
 STATIC = ['timestamp', 'run_cmd', 'run_dir', 'model']
 STATS = ['total_tests', 'completed_tests', 'percent_cases_well_formed',
          'tries_observed', 'error_outputs', 'num_malformed_responses',
@@ -298,35 +403,15 @@ STATS = ['total_tests', 'completed_tests', 'percent_cases_well_formed',
          'syntax_errors', 'indentation_errors', 'exhausted_context_windows',
          'prompt_tokens', 'completion_tokens', 'test_timeouts', 'total_cost',
          'seconds_per_case', 'aider_commit']
+write_tsv(tsv_file, STATIC, STATS, [row])
 
-existing_rows = []
-existing_header = None
-if os.path.isfile(tsv_file):
-    with open(tsv_file, newline='') as f:
-        reader = csv.reader(f, delimiter='\t')
-        existing_header = next(reader, None)
-        for r in reader:
-            existing_rows.append(r)
-
-static_set, stat_set = set(STATIC), set(STATS)
-old_mid_cols = [c for c in (existing_header or []) if c not in static_set and c not in stat_set]
-new_mid_cols = [k for k in row if k not in static_set and k not in stat_set and k not in old_mid_cols]
-new_header = STATIC + new_mid_cols + old_mid_cols + STATS
-
-if existing_header and existing_header != new_header:
-    rebuilt = []
-    for old_row in existing_rows:
-        old_dict = dict(zip(existing_header, old_row))
-        rebuilt.append([old_dict.get(c, '') for c in new_header])
-    existing_rows = rebuilt
-
-os.makedirs(os.path.dirname(tsv_file) or '.', exist_ok=True)
-with open(tsv_file, 'w', newline='') as f:
-    writer = csv.writer(f, delimiter='\t', lineterminator='\n')
-    writer.writerow(new_header)
-    for r in existing_rows:
-        writer.writerow(r)
-    writer.writerow([row.get(c, '') for c in new_header])
+TEST_STATIC = ['timestamp', 'run_cmd', 'language', 'exercise', 'model']
+TEST_STATS = ['pass', 'passed_at_try', 'tries_taken', 'cost', 'duration',
+              'error_outputs', 'num_malformed_responses', 'syntax_errors',
+              'indentation_errors', 'user_asks', 'lazy_comments',
+              'exhausted_context_windows', 'test_timeouts', 'prompt_tokens',
+              'completion_tokens', 'aider_commit']
+write_tsv(per_test_tsv_file, TEST_STATIC, TEST_STATS, per_test_rows)
 
 pass_rate_str = ' '.join(
     f'{i + 1}:{row[f\"pass_rate_{i + 1}\"]}' for i in range(tries)
@@ -338,7 +423,8 @@ print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model}: '
       f'pass_rate%={pass_rate_str} '
       f'well_formed={row[\"percent_cases_well_formed\"]}% cost=\${row[\"total_cost\"]} '
       f'sec/case={row[\"seconds_per_case\"]}')
-" "$TRACK_TSV" "$run_dir" "$cmd_name" "openai/$MODEL" "$srv_file" "$since_ts" \
+print(f'{len(per_test_rows)} per-test row(s) appended: {per_test_tsv_file}')
+" "$TRACK_TSV" "$PER_TEST_TSV" "$run_dir" "$cmd_name" "openai/$MODEL" "$srv_file" "$since_ts" \
       "edit_format=$edit_format" "tries=$TRIES" "max_tokens=$MAX_TOKENS" \
       "reasoning_effort=$REASONING_EFFORT" "request_timeout=$REQUEST_TIMEOUT"
 }
@@ -639,6 +725,7 @@ case "$CMD" in
     echo "  LLAMA_BASE_URL=http://host:port/v1    (default: tailscale :3002)"
     echo "  LLAMA_CONTAINER=<name>                (default: auto-detect running llama-server)"
     echo "  TRACK_TSV=<path>                      (default: ./results/eval-results.tsv)"
+    echo "  PER_TEST_TSV=<path>                   (default: ./results/eval-results-per-test.tsv)"
     echo ""
     echo "Results are saved to ./results/"
     echo ""
@@ -649,6 +736,11 @@ case "$CMD" in
     echo "'docker inspect'. Pure perf/infra flags (threads, GPU-layer split,"
     echo "batching, logging, networking) are excluded so they don't pollute"
     echo "behavior comparisons across runs."
+    echo ""
+    echo "It also appends one row per exercise to eval-results-per-test.tsv (same"
+    echo "settings columns, plus language/exercise/pass/passed_at_try/cost/duration/"
+    echo "... per exercise) -- e.g. grep zipper results/eval-results-per-test.tsv"
+    echo "to see how every model/config you've run has handled that one exercise."
     echo ""
     echo "Compare runs:"
     echo "  ./run.sh shell"
