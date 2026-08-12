@@ -7,10 +7,11 @@ set -euo pipefail
 # The model name after openai/ should match your llama.cpp --alias.
 # Check what your server reports: curl http://100.71.29.121:3002/v1/models
 #
-# Edit formats:
-#   whole    - model outputs entire file (safest for weaker models)
+# Edit formats (set via EDIT_FORMAT=<format>, e.g. EDIT_FORMAT=diff ./run.sh quick):
+#   whole    - model outputs entire file (safest for weaker models) [default]
 #   diff     - model outputs search/replace blocks (faster, needs stronger model)
 #   udiff    - unified diff format
+# The dedicated `diff` command is just shorthand for EDIT_FORMAT=diff ./run.sh quick.
 #
 # --reasoning-effort / --thinking-tokens send OpenAI-o-series/Anthropic-style
 # fields (extra_body.reasoning_effort / thinking.budget_tokens) that llama.cpp
@@ -45,6 +46,9 @@ cd "$(dirname "$0")"
 MODEL="${2:-Default}"  # default to your llama.cpp --alias
 CMD="${1:-help}"
 REASONING_EFFORT="${REASONING_EFFORT-low}"  # empty string disables
+EDIT_FORMAT="${EDIT_FORMAT:-whole}"         # whole|diff|udiff|... forwarded as aider's --edit-format
+                                             # (applies to smoke/quick/python/polyglot/full/custom;
+                                             # the dedicated `diff` command always forces diff, that's its purpose)
 TRIES="${TRIES:-4}"                         # fix-up attempts per exercise (default 2 gave too many false negatives)
 MAX_TOKENS="${MAX_TOKENS:-16000}"           # hard cap on thinking+answer tokens
                                              # (6-8k caps truncated legitimate answers on some
@@ -104,7 +108,11 @@ SRV_BLACKLIST="--server --host --port -lv --log-timestamps --log-colors --verbos
 --fit --fit-ctx --cache-prompt --checkpoint-every-n-tokens --slot-save-path \
 --ctx-checkpoints --metrics --api-key --ssl-key-file --ssl-cert-file --timeout \
 --no-webui --draft-max --draft-min --draft-p-min --gpu-layers-draft --model-draft \
+--jinja --checkpoint-min-step --cache-ram --cache-idle-slots --kv-unified \
+--spec-draft-ngl --spec-draft-n-cpu-moe \
 --device --device-draft --spec-draft-type-k --spec-draft-type-v --defrag-thold"
+
+
 
 # Extract non-blacklisted llama-server CLI args as key=value lines
 # (prefixed srv.<flag>=<value>). Best-effort: silent no-op if no server
@@ -196,6 +204,9 @@ tries = max((len(r.get('tests_outcomes', [])) for r in results), default=0)
 passed_by_try = [0] * tries
 cost = duration = 0.0
 error_outputs = malformed = with_malformed = syntax_errors = test_timeouts = exhausted = 0
+user_asks = lazy_comments = indentation_errors = 0
+prompt_tokens = completion_tokens = 0
+aider_commits = set()
 
 for r in results:
     completed += 1
@@ -213,6 +224,13 @@ for r in results:
     if nm:
         with_malformed += 1
     syntax_errors += r.get('syntax_errors', 0) or 0
+    indentation_errors += r.get('indentation_errors', 0) or 0
+    user_asks += r.get('num_user_asks', 0) or 0
+    if r.get('commit_hash'):
+        aider_commits.add(r['commit_hash'])
+    lazy_comments += r.get('lazy_comments', 0) or 0
+    prompt_tokens += r.get('prompt_tokens', 0) or 0
+    completion_tokens += r.get('completion_tokens', 0) or 0
 
 timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -239,26 +257,47 @@ if os.path.isfile(srv_file):
 
 row['total_tests'] = str(total_tests)
 row['completed_tests'] = str(completed)
+# One column per actual try (pass_rate_1..pass_rate_N, N = tries_observed),
+# not just first/last -- TRIES is user-configurable per run.sh invocation, so
+# the column count varies run to run; these fall into the same dynamic
+# grows/shrinks-across-rows bucket as the srv.* columns below, rather than
+# the fixed STATS list, since their names/count are not known in advance.
 if completed and tries:
-    row['pass_rate_1'] = f'{100 * passed_by_try[0] / completed:.1f}'
-    row['pass_rate_last'] = f'{100 * passed_by_try[-1] / completed:.1f}'
-    row['percent_well_formed'] = f'{100 * (1 - with_malformed / completed):.1f}'
+    for i in range(tries):
+        row[f'pass_rate_{i + 1}'] = f'{100 * passed_by_try[i] / completed:.1f}'
+    row['percent_cases_well_formed'] = f'{100 * (1 - with_malformed / completed):.1f}'
 else:
-    row['pass_rate_1'] = row['pass_rate_last'] = row['percent_well_formed'] = ''
+    row['percent_cases_well_formed'] = ''
 row['tries_observed'] = str(tries)
 row['error_outputs'] = str(error_outputs)
 row['num_malformed_responses'] = str(malformed)
+row['num_with_malformed_responses'] = str(with_malformed)
+row['user_asks'] = str(user_asks)
+row['lazy_comments'] = str(lazy_comments)
 row['syntax_errors'] = str(syntax_errors)
-row['test_timeouts'] = str(test_timeouts)
+row['indentation_errors'] = str(indentation_errors)
 row['exhausted_context_windows'] = str(exhausted)
+row['prompt_tokens'] = str(prompt_tokens)
+row['completion_tokens'] = str(completion_tokens)
+row['test_timeouts'] = str(test_timeouts)
 row['total_cost'] = f'{cost:.4f}'
 row['seconds_per_case'] = f'{duration / completed:.1f}' if completed else ''
+# aider's own short git commit hash (e.g. 'a1b2c3d', or 'a1b2c3d-dirty' if
+# the container's aider checkout had local changes) -- more precise than a
+# version string, and free: benchmark.py already stamps it into every
+# .aider.results.json (see run_test_real's commit_hash= field), no extra
+# docker exec needed. Joined with ',' in the rare case a single run somehow
+# spans more than one aider commit, so drift is visible rather than silently
+# picking one.
+row['aider_commit'] = ','.join(sorted(aider_commits))
 
 STATIC = ['timestamp', 'run_cmd', 'run_dir', 'model']
-STATS = ['total_tests', 'completed_tests', 'pass_rate_1', 'pass_rate_last',
-         'percent_well_formed', 'tries_observed', 'error_outputs',
-         'num_malformed_responses', 'syntax_errors', 'test_timeouts',
-         'exhausted_context_windows', 'total_cost', 'seconds_per_case']
+STATS = ['total_tests', 'completed_tests', 'percent_cases_well_formed',
+         'tries_observed', 'error_outputs', 'num_malformed_responses',
+         'num_with_malformed_responses', 'user_asks', 'lazy_comments',
+         'syntax_errors', 'indentation_errors', 'exhausted_context_windows',
+         'prompt_tokens', 'completion_tokens', 'test_timeouts', 'total_cost',
+         'seconds_per_case', 'aider_commit']
 
 existing_rows = []
 existing_header = None
@@ -289,11 +328,15 @@ with open(tsv_file, 'w', newline='') as f:
         writer.writerow(r)
     writer.writerow([row.get(c, '') for c in new_header])
 
+pass_rate_str = ' '.join(
+    f'{i + 1}:{row[f\"pass_rate_{i + 1}\"]}' for i in range(tries)
+) or '(no tries observed)'
+
 print(f'Eval row appended: {tsv_file}')
 print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model}: '
       f'completed={row[\"completed_tests\"]}/{row[\"total_tests\"]} '
-      f'pass_rate_1={row[\"pass_rate_1\"]} pass_rate_last={row[\"pass_rate_last\"]} '
-      f'well_formed={row[\"percent_well_formed\"]}% cost=\${row[\"total_cost\"]} '
+      f'pass_rate%={pass_rate_str} '
+      f'well_formed={row[\"percent_cases_well_formed\"]}% cost=\${row[\"total_cost\"]} '
       f'sec/case={row[\"seconds_per_case\"]}')
 " "$TRACK_TSV" "$run_dir" "$cmd_name" "openai/$MODEL" "$srv_file" "$since_ts" \
       "edit_format=$edit_format" "tries=$TRIES" "max_tokens=$MAX_TOKENS" \
@@ -302,10 +345,14 @@ print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model}: '
 
 # Generate model-settings YAML matching this run's model name so
 # extra_params.timeout actually applies (aider matches by exact name).
+# Takes the edit format to record (defaults to $EDIT_FORMAT) so this file
+# never disagrees with whatever --edit-format actually gets passed to
+# benchmark.py for this invocation.
 write_model_settings() {
+  local fmt="${1:-$EDIT_FORMAT}"
   cat > results/.model-settings.yml <<EOF
 - name: openai/$MODEL
-  edit_format: whole
+  edit_format: $fmt
   use_repo_map: false
   use_system_prompt: true
   streaming: false
@@ -422,7 +469,7 @@ case "$CMD" in
     # 1 exercise — verify the setup works
     $DOCKER_RUN ./benchmark/benchmark.py /results/smoke \
       --model "openai/$MODEL" \
-      --edit-format whole \
+      --edit-format "$EDIT_FORMAT" \
       --threads 1 \
       --tries "$TRIES" \
       --languages python \
@@ -431,7 +478,7 @@ case "$CMD" in
       --new \
       $(common_flags) \
       "${GUARD_ARGS[@]}"
-    track_eval smoke results/smoke whole "$RUN_START_TS"
+    track_eval smoke results/smoke "$EDIT_FORMAT" "$RUN_START_TS"
     ;;
 
   quick)
@@ -440,7 +487,7 @@ case "$CMD" in
     # 5 python exercises — quick feedback loop
     $DOCKER_RUN ./benchmark/benchmark.py /results/quick \
       --model "openai/$MODEL" \
-      --edit-format whole \
+      --edit-format "$EDIT_FORMAT" \
       --threads 1 \
       --tries "$TRIES" \
       --languages python \
@@ -449,7 +496,7 @@ case "$CMD" in
       --new \
       $(common_flags) \
       "${GUARD_ARGS[@]}"
-    track_eval quick results/quick whole "$RUN_START_TS"
+    track_eval quick results/quick "$EDIT_FORMAT" "$RUN_START_TS"
     ;;
 
   python)
@@ -458,7 +505,7 @@ case "$CMD" in
     # All python exercises (~30-40 depending on model speed)
     $DOCKER_RUN ./benchmark/benchmark.py /results/python \
       --model "openai/$MODEL" \
-      --edit-format whole \
+      --edit-format "$EDIT_FORMAT" \
       --threads 1 \
       --tries "$TRIES" \
       --languages python \
@@ -466,7 +513,7 @@ case "$CMD" in
       --new \
       $(common_flags) \
       "${GUARD_ARGS[@]}"
-    track_eval python results/python whole "$RUN_START_TS"
+    track_eval python results/python "$EDIT_FORMAT" "$RUN_START_TS"
     ;;
 
   polyglot)
@@ -475,7 +522,7 @@ case "$CMD" in
     # Subset across all languages (3 per language = 18 exercises)
     $DOCKER_RUN ./benchmark/benchmark.py /results/polyglot \
       --model "openai/$MODEL" \
-      --edit-format whole \
+      --edit-format "$EDIT_FORMAT" \
       --threads 1 \
       --tries "$TRIES" \
       --num-tests 3 \
@@ -483,7 +530,7 @@ case "$CMD" in
       --new \
       $(common_flags) \
       "${GUARD_ARGS[@]}"
-    track_eval polyglot results/polyglot whole "$RUN_START_TS"
+    track_eval polyglot results/polyglot "$EDIT_FORMAT" "$RUN_START_TS"
     ;;
 
   full)
@@ -492,19 +539,19 @@ case "$CMD" in
     # All 225 exercises — the real deal
     $DOCKER_RUN ./benchmark/benchmark.py /results/full \
       --model "openai/$MODEL" \
-      --edit-format whole \
+      --edit-format "$EDIT_FORMAT" \
       --threads 1 \
       --tries "$TRIES" \
       --exercises-dir /benchmarks/polyglot-benchmark \
       --new \
       $(common_flags) \
       "${GUARD_ARGS[@]}"
-    track_eval full results/full whole "$RUN_START_TS"
+    track_eval full results/full "$EDIT_FORMAT" "$RUN_START_TS"
     ;;
 
   diff)
     auto_clean results/diff "${@:3}"
-    write_model_settings
+    write_model_settings diff
     # Same as quick but with diff edit format (tests if model can do search/replace)
     $DOCKER_RUN ./benchmark/benchmark.py /results/diff \
       --model "openai/$MODEL" \
@@ -530,22 +577,24 @@ case "$CMD" in
     # Pass arbitrary args after the model name
     shift  # remove 'custom'
     guard_reuse results/custom "${@:2}"
-    write_model_settings
-    $DOCKER_RUN ./benchmark/benchmark.py /results/custom \
-      --model "openai/$MODEL" \
-      --exercises-dir /benchmarks/polyglot-benchmark \
-      --new \
-      $(common_flags) \
-      "${GUARD_ARGS[@]}"
-    # Recover --edit-format from the passed-through args (defaults to
-    # write_model_settings' "whole" if the caller didn't override it).
-    CUSTOM_EDIT_FORMAT="whole"
+    # Recover --edit-format from the passed-through args, if the caller gave
+    # one explicitly; otherwise fall back to $EDIT_FORMAT (default "whole"),
+    # same as every other command. Computed before write_model_settings so
+    # the YAML's edit_format always matches what's actually requested.
+    CUSTOM_EDIT_FORMAT="$EDIT_FORMAT"
     args=("${GUARD_ARGS[@]}")
     for ((i = 0; i < ${#args[@]}; i++)); do
       if [[ "${args[$i]}" == "--edit-format" && $((i + 1)) -lt ${#args[@]} ]]; then
         CUSTOM_EDIT_FORMAT="${args[$((i + 1))]}"
       fi
     done
+    write_model_settings "$CUSTOM_EDIT_FORMAT"
+    $DOCKER_RUN ./benchmark/benchmark.py /results/custom \
+      --model "openai/$MODEL" \
+      --exercises-dir /benchmarks/polyglot-benchmark \
+      --new \
+      $(common_flags) \
+      "${GUARD_ARGS[@]}"
     track_eval custom results/custom "$CUSTOM_EDIT_FORMAT" "$RUN_START_TS"
     ;;
 
@@ -578,6 +627,9 @@ case "$CMD" in
     echo "Check available models: curl http://100.71.29.121:3002/v1/models"
     echo ""
     echo "Env overrides:"
+    echo "  EDIT_FORMAT=whole|diff|udiff|...      (default: whole) aider's --edit-format;"
+    echo "                                        applies to smoke/quick/python/polyglot/full/custom"
+    echo "                                        (the diff command always forces diff)"
     echo "  TRIES=<n>                             (default: 4) fix-up attempts per exercise"
     echo "  MAX_TOKENS=<n>                        (default: 16000) hard cap, thinking+answer"
     echo "  DECODE_TPS=<n>                         (default: 70) for timeout auto-calc"
