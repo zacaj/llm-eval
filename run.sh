@@ -28,23 +28,39 @@ set -euo pipefail
 # is no streaming option.
 #
 # Usage:
-#   ./run.sh <command> [model-alias] [extra-args...]
+#   ./run.sh <command> [exercise ...] [flags...]
+#
+# The model is NOT a positional arg -- set MODEL=<alias> (your llama-server's
+# --alias) if it isn't "Default"; most setups only ever have one model loaded
+# at a time, so there's rarely a reason to name it every invocation. Bare
+# words after <command> are exercise-name substrings (aider's --keywords) --
+# e.g. `./run.sh smoke connect` targets the "connect" exercise specifically,
+# NOT a model named "connect". Anything starting with '-' (e.g. --clean,
+# --resume) is forwarded to benchmark.py as-is; everything before the first
+# such flag is treated as exercise names.
+#
+# smoke/quick/polyglot/diff use a fixed, deterministic default exercise set
+# per command (not random) so repeated runs are directly comparable across
+# models/configs -- see the `random` command if you actually want a random
+# sample instead.
 #
 # Examples:
-#   ./run.sh smoke                    # 1 python exercise, ~2 min
-#   ./run.sh quick                    # 5 python exercises, ~10 min
-#   ./run.sh python                   # all python exercises, ~30 min
-#   ./run.sh full                     # all 225 exercises, ~2-4 hours
-#   ./run.sh quick my-model-alias     # specify model name
-#   ./run.sh stats <run-dir>          # regenerate stats from a completed run
-#   ./run.sh shell                    # open interactive shell in container
+#   ./run.sh smoke                          # 1 fixed python exercise, ~2 min
+#   ./run.sh quick                          # 5 fixed python exercises, ~10 min
+#   ./run.sh quick zipper leap              # just those 2 exercises instead
+#   ./run.sh random 5                       # 5 RANDOM python exercises
+#   ./run.sh python                         # all python exercises, ~30 min
+#   ./run.sh full                           # all 225 exercises, ~2-4 hours
+#   MODEL=my-alias ./run.sh quick           # specify model name
+#   ./run.sh stats <run-dir>                # regenerate stats from a completed run
+#   ./run.sh shell                          # open interactive shell in container
 #
-# Results go to ./results/<timestamp>--<run-name>/
+# Results go to ./results/<run-name>/
 
 cd "$(dirname "$0")"
 
-MODEL="${2:-Default}"  # default to your llama.cpp --alias
 CMD="${1:-help}"
+MODEL="${MODEL:-Default}"  # your llama-server's --alias; NOT a positional arg (see header)
 REASONING_EFFORT="${REASONING_EFFORT-low}"  # empty string disables
 EDIT_FORMAT="${EDIT_FORMAT:-whole}"         # whole|diff|udiff|... forwarded as aider's --edit-format
                                              # (applies to smoke/quick/python/polyglot/full/custom;
@@ -434,6 +450,95 @@ print(f'{len(per_test_rows)} per-test row(s) appended: {per_test_tsv_file}')
 # Takes the edit format to record (defaults to $EDIT_FORMAT) so this file
 # never disagrees with whatever --edit-format actually gets passed to
 # benchmark.py for this invocation.
+# Split "$@" into EXERCISE_ARGS (bare words before the first '-'-prefixed
+# token -- exercise-name substrings) and PASSTHRU_ARGS (that flag and
+# everything after it, forwarded to benchmark.py as-is, e.g. --clean/
+# --resume/other benchmark.py flags). Positional-args-then-flags, like any
+# normal CLI -- avoids needing to know which flags take a value.
+split_exercise_args() {
+  EXERCISE_ARGS=()
+  PASSTHRU_ARGS=()
+  local seen_flag=0 a
+  for a in "$@"; do
+    if [[ $seen_flag -eq 1 ]]; then
+      PASSTHRU_ARGS+=("$a")
+    elif [[ "$a" == -* ]]; then
+      seen_flag=1
+      PASSTHRU_ARGS+=("$a")
+    else
+      EXERCISE_ARGS+=("$a")
+    fi
+  done
+}
+
+# Join newline-separated stdin into a single comma-separated string (no
+# external `paste` dependency).
+join_lines_comma() {
+  local out="" line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ -z "$out" ]]; then out="$line"; else out="$out,$line"; fi
+  done
+  echo "$out"
+}
+
+# The 6 polyglot-benchmark language dirs (see README: "225 Exercism
+# exercises across 6 languages"). Stable repo structure, safe to hardcode.
+POLYGLOT_LANGUAGES="cpp go java javascript python rust"
+
+EXERCISE_LIST_CACHE_DIR="results/.exercise-lists"
+
+# Real exercise directory names for a language, queried once from inside the
+# container (there's no way to know these ahead of time without asking the
+# image what polyglot-benchmark actually contains -- it's not mounted on the
+# host) and cached to disk so repeat runs don't pay the container-startup
+# cost again. Delete results/.exercise-lists/ to force a re-list (e.g. after
+# rebuilding the image against a newer polyglot-benchmark).
+list_exercises() {
+  local lang="$1"
+  local cache="$EXERCISE_LIST_CACHE_DIR/$lang.txt"
+  if [[ ! -s "$cache" ]]; then
+    mkdir -p "$EXERCISE_LIST_CACHE_DIR"
+    echo "Listing $lang exercises (first time only, cached after this)..." >&2
+    $DOCKER_RUN bash -c "find /benchmarks/polyglot-benchmark/$lang/exercises/practice -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort" > "$cache" 2>/dev/null
+    if [[ ! -s "$cache" ]]; then
+      rm -f "$cache"
+      echo "ERROR: failed to list $lang exercises (bad language name, or image not built yet?)" >&2
+      exit 1
+    fi
+  fi
+  cat "$cache"
+}
+
+# First N exercise names for a language, sorted alphabetically -- the fixed,
+# deterministic default set used when no exercise names are given explicitly.
+default_exercises() {
+  list_exercises "$1" | head -n "$2"
+}
+
+# Error out clearly (with the real exercise list) if any named exercise
+# doesn't substring-match anything for $lang, rather than silently running 0
+# exercises or letting benchmark.py fail 30+ seconds in.
+validate_exercises() {
+  local lang="$1"
+  shift
+  local all_exercises name found ex
+  all_exercises="$(list_exercises "$lang")"
+  for name in "$@"; do
+    found=0
+    while IFS= read -r ex; do
+      [[ "$ex" == *"$name"* ]] && { found=1; break; }
+    done <<< "$all_exercises"
+    if [[ $found -eq 0 ]]; then
+      echo "ERROR: no $lang exercise matches '$name'." >&2
+      echo "Available $lang exercises:" >&2
+      echo "$all_exercises" | tr '\n' ' ' >&2
+      echo "" >&2
+      exit 1
+    fi
+  done
+}
+
 write_model_settings() {
   local fmt="${1:-$EDIT_FORMAT}"
   cat > results/.model-settings.yml <<EOF
@@ -453,6 +558,11 @@ common_flags() {
   local flags=(--read-model-settings /results/.model-settings.yml)
   if [[ -n "$REASONING_EFFORT" ]]; then
     flags+=(--reasoning-effort "$REASONING_EFFORT")
+  fi
+  # KEYWORDS is set per-case-branch below (from named exercises, or a
+  # deterministic default set) before common_flags is called.
+  if [[ -n "${KEYWORDS:-}" ]]; then
+    flags+=(--keywords "$KEYWORDS")
   fi
   echo "${flags[@]}"
 }
@@ -540,6 +650,43 @@ auto_clean() {
   [[ $has_resume -eq 0 ]] && do_clean "$run_dir"
 }
 
+# Shared body for the fixed-python-subset commands (smoke/quick/diff): pick
+# either the exercises named on the command line, or this preset's fixed
+# deterministic default set of size $default_n (see list_exercises/
+# default_exercises above -- NOT random, so repeated runs are directly
+# comparable across models/configs). $1=name (results subdir + run_cmd),
+# $2=default exercise count, $3=edit format to force ("" = use $EDIT_FORMAT),
+# remaining args = this command's args after the command name itself.
+run_python_subset() {
+  local name="$1" default_n="$2" forced_format="$3"
+  shift 3
+  split_exercise_args "$@"
+  auto_clean "results/$name" "${PASSTHRU_ARGS[@]}"
+  local num_tests
+  if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
+    validate_exercises python "${EXERCISE_ARGS[@]}"
+    KEYWORDS="$(IFS=,; echo "${EXERCISE_ARGS[*]}")"
+    num_tests="${#EXERCISE_ARGS[@]}"
+  else
+    KEYWORDS="$(default_exercises python "$default_n" | join_lines_comma)"
+    num_tests="$default_n"
+  fi
+  local fmt="${forced_format:-$EDIT_FORMAT}"
+  write_model_settings "$fmt"
+  $DOCKER_RUN ./benchmark/benchmark.py "/results/$name" \
+    --model "openai/$MODEL" \
+    --edit-format "$fmt" \
+    --threads 1 \
+    --tries "$TRIES" \
+    --languages python \
+    --num-tests "$num_tests" \
+    --exercises-dir /benchmarks/polyglot-benchmark \
+    --new \
+    $(common_flags) \
+    "${GUARD_ARGS[@]}"
+  track_eval "$name" "results/$name" "$fmt" "$RUN_START_TS"
+}
+
 case "$CMD" in
   build)
     docker compose build
@@ -550,45 +697,56 @@ case "$CMD" in
     ;;
 
   smoke)
-    auto_clean results/smoke "${@:3}"
-    write_model_settings
-    # 1 exercise — verify the setup works
-    $DOCKER_RUN ./benchmark/benchmark.py /results/smoke \
-      --model "openai/$MODEL" \
-      --edit-format "$EDIT_FORMAT" \
-      --threads 1 \
-      --tries "$TRIES" \
-      --languages python \
-      --num-tests 1 \
-      --exercises-dir /benchmarks/polyglot-benchmark \
-      --new \
-      $(common_flags) \
-      "${GUARD_ARGS[@]}"
-    track_eval smoke results/smoke "$EDIT_FORMAT" "$RUN_START_TS"
+    # 1 exercise (fixed default, or the one(s) you named) — verify the setup works
+    run_python_subset smoke 1 "" "${@:2}"
     ;;
 
   quick)
-    auto_clean results/quick "${@:3}"
+    # 5 python exercises (fixed default set, or the ones you named) — quick feedback loop
+    run_python_subset quick 5 "" "${@:2}"
+    ;;
+
+  diff)
+    # Same as quick but with diff edit format (tests if model can do search/replace)
+    run_python_subset diff 5 diff "${@:2}"
+    ;;
+
+  random)
+    # TRUE random exercise(s) -- unlike smoke/quick/diff, which are fixed and
+    # deterministic on purpose so repeated runs are directly comparable
+    # across models/configs. Use this for exploratory/coverage testing instead.
+    RANDOM_N="${2:-5}"
+    split_exercise_args "${@:3}"
+    if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
+      echo "ERROR: 'random' picks exercises randomly -- naming specific ones" >&2
+      echo "(${EXERCISE_ARGS[*]}) defeats the point; use 'quick <names>' instead." >&2
+      exit 1
+    fi
+    auto_clean results/random "${PASSTHRU_ARGS[@]}"
     write_model_settings
-    # 5 python exercises — quick feedback loop
-    $DOCKER_RUN ./benchmark/benchmark.py /results/quick \
+    $DOCKER_RUN ./benchmark/benchmark.py /results/random \
       --model "openai/$MODEL" \
       --edit-format "$EDIT_FORMAT" \
       --threads 1 \
       --tries "$TRIES" \
       --languages python \
-      --num-tests 5 \
+      --num-tests "$RANDOM_N" \
       --exercises-dir /benchmarks/polyglot-benchmark \
       --new \
       $(common_flags) \
       "${GUARD_ARGS[@]}"
-    track_eval quick results/quick "$EDIT_FORMAT" "$RUN_START_TS"
+    track_eval random results/random "$EDIT_FORMAT" "$RUN_START_TS"
     ;;
 
   python)
-    guard_reuse results/python "${@:3}"
+    split_exercise_args "${@:2}"
+    guard_reuse results/python "${PASSTHRU_ARGS[@]}"
+    if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
+      validate_exercises python "${EXERCISE_ARGS[@]}"
+      KEYWORDS="$(IFS=,; echo "${EXERCISE_ARGS[*]}")"
+    fi
     write_model_settings
-    # All python exercises (~30-40 depending on model speed)
+    # All python exercises (~30-40 depending on model speed), or just the named ones
     $DOCKER_RUN ./benchmark/benchmark.py /results/python \
       --model "openai/$MODEL" \
       --edit-format "$EDIT_FORMAT" \
@@ -603,15 +761,29 @@ case "$CMD" in
     ;;
 
   polyglot)
-    auto_clean results/polyglot "${@:3}"
+    split_exercise_args "${@:2}"
+    auto_clean results/polyglot "${PASSTHRU_ARGS[@]}"
+    if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
+      KEYWORDS="$(IFS=,; echo "${EXERCISE_ARGS[*]}")"
+      POLY_NUM_TESTS="${#EXERCISE_ARGS[@]}"
+    else
+      # Deterministic default: 3 fixed exercises PER LANGUAGE, 18 total.
+      POLY_DEFAULTS=""
+      for lang in $POLYGLOT_LANGUAGES; do
+        lang_default="$(default_exercises "$lang" 3 | join_lines_comma)"
+        if [[ -z "$POLY_DEFAULTS" ]]; then POLY_DEFAULTS="$lang_default"; else POLY_DEFAULTS="$POLY_DEFAULTS,$lang_default"; fi
+      done
+      KEYWORDS="$POLY_DEFAULTS"
+      POLY_NUM_TESTS=18
+    fi
     write_model_settings
-    # Subset across all languages (3 per language = 18 exercises)
+    # 3 exercises per language, 18 total (or just the named ones)
     $DOCKER_RUN ./benchmark/benchmark.py /results/polyglot \
       --model "openai/$MODEL" \
       --edit-format "$EDIT_FORMAT" \
       --threads 1 \
       --tries "$TRIES" \
-      --num-tests 3 \
+      --num-tests "$POLY_NUM_TESTS" \
       --exercises-dir /benchmarks/polyglot-benchmark \
       --new \
       $(common_flags) \
@@ -620,9 +792,13 @@ case "$CMD" in
     ;;
 
   full)
-    guard_reuse results/full "${@:3}"
+    split_exercise_args "${@:2}"
+    guard_reuse results/full "${PASSTHRU_ARGS[@]}"
+    if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
+      KEYWORDS="$(IFS=,; echo "${EXERCISE_ARGS[*]}")"
+    fi
     write_model_settings
-    # All 225 exercises — the real deal
+    # All 225 exercises across all languages, or just the named ones — the real deal
     $DOCKER_RUN ./benchmark/benchmark.py /results/full \
       --model "openai/$MODEL" \
       --edit-format "$EDIT_FORMAT" \
@@ -635,24 +811,6 @@ case "$CMD" in
     track_eval full results/full "$EDIT_FORMAT" "$RUN_START_TS"
     ;;
 
-  diff)
-    auto_clean results/diff "${@:3}"
-    write_model_settings diff
-    # Same as quick but with diff edit format (tests if model can do search/replace)
-    $DOCKER_RUN ./benchmark/benchmark.py /results/diff \
-      --model "openai/$MODEL" \
-      --edit-format diff \
-      --threads 1 \
-      --tries "$TRIES" \
-      --languages python \
-      --num-tests 5 \
-      --exercises-dir /benchmarks/polyglot-benchmark \
-      --new \
-      $(common_flags) \
-      "${GUARD_ARGS[@]}"
-    track_eval diff results/diff diff "$RUN_START_TS"
-    ;;
-
   stats)
     # Regenerate stats from a previous run
     RUN_DIR="${2:?Usage: ./run.sh stats <run-dir>}"
@@ -660,13 +818,15 @@ case "$CMD" in
     ;;
 
   custom)
-    # Pass arbitrary args after the model name
-    shift  # remove 'custom'
-    guard_reuse results/custom "${@:2}"
-    # Recover --edit-format from the passed-through args, if the caller gave
-    # one explicitly; otherwise fall back to $EDIT_FORMAT (default "whole"),
-    # same as every other command. Computed before write_model_settings so
-    # the YAML's edit_format always matches what's actually requested.
+    split_exercise_args "${@:2}"
+    guard_reuse results/custom "${PASSTHRU_ARGS[@]}"
+    if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
+      KEYWORDS="$(IFS=,; echo "${EXERCISE_ARGS[*]}")"
+    fi
+    # Recover --edit-format from the passed-through flags, if given
+    # explicitly; otherwise fall back to $EDIT_FORMAT (default "whole"), same
+    # as every other command. Computed before write_model_settings so the
+    # YAML's edit_format always matches what's actually requested.
     CUSTOM_EDIT_FORMAT="$EDIT_FORMAT"
     args=("${GUARD_ARGS[@]}")
     for ((i = 0; i < ${#args[@]}; i++)); do
@@ -688,31 +848,42 @@ case "$CMD" in
     echo "Aider Benchmark Runner"
     echo ""
     echo "Commands:"
-    echo "  build                Build the Docker image (~5-10 min first time)"
-    echo "  smoke [model]        1 python exercise (~2 min)"
-    echo "  quick [model]        5 python exercises (~10 min)"
-    echo "  python [model]       All python exercises (~30 min)"
-    echo "  polyglot [model]     3 exercises per language, 18 total (~30 min)"
-    echo "  full [model]         All 225 exercises (~2-4 hours)"
-    echo "  diff [model]         5 python w/ diff edit format"
-    echo "  stats <run-dir>      Regenerate stats from completed run"
-    echo "  shell                Interactive shell in benchmark container"
-    echo "  custom [model] args  Pass arbitrary benchmark.py args"
+    echo "  build                     Build the Docker image (~5-10 min first time)"
+    echo "  smoke [exercise ...]      1 FIXED python exercise (~2 min)"
+    echo "  quick [exercise ...]      5 FIXED python exercises (~10 min)"
+    echo "  diff [exercise ...]       Same as quick but forces diff edit format"
+    echo "  random <n> [flags]        <n> RANDOM python exercises (default n=5)"
+    echo "  python [exercise ...]     All python exercises, or just the named ones (~30 min)"
+    echo "  polyglot [exercise ...]   3 FIXED exercises per language (18 total), or just the named ones"
+    echo "  full [exercise ...]       All 225 exercises, or just the named ones (~2-4 hours)"
+    echo "  stats <run-dir>           Regenerate stats from completed run"
+    echo "  shell                     Interactive shell in benchmark container"
+    echo "  custom [exercise ...] args  Pass arbitrary benchmark.py args"
     echo ""
-    echo "smoke/quick/polyglot/diff auto-clean their results dir on every run (old"
-    echo "results moved to results/OLD/<name>) so each invocation is independent --"
+    echo "smoke/quick/diff/polyglot use a FIXED, deterministic default exercise set"
+    echo "(not random) so repeated runs are directly comparable across models/configs;"
+    echo "use 'random' if you actually want randomness. [exercise ...] are bare-word"
+    echo "substrings of exercise names (aider's --keywords) -- e.g. './run.sh quick"
+    echo "zipper leap' runs just those 2 instead of the fixed default 5. Everything"
+    echo "from the first '-'-prefixed arg onward is forwarded to benchmark.py as-is."
+    echo ""
+    echo "Model is NOT a positional arg -- set MODEL=<alias> if it isn't 'Default'"
+    echo "(most llama.cpp setups only run one model at a time, so there's rarely a"
+    echo "reason to name it every invocation). Check available models/aliases:"
+    echo "  curl http://100.71.29.121:3002/v1/models"
+    echo ""
+    echo "smoke/quick/diff/polyglot/random auto-clean their results dir on every run"
+    echo "(old results moved to results/OLD/<name>) so each invocation is independent --"
     echo "pass --resume to opt out and reuse/continue existing results instead."
     echo ""
     echo "python/full can run for hours, so they don't auto-clean -- if their results"
     echo "dir already has results in it, run.sh refuses to proceed until you pass:"
     echo "  --clean               Move old results to results/OLD/<name>, start fresh"
     echo "  --resume              Proceed and let benchmark.py reuse/continue them"
-    echo "e.g. ./run.sh full my-model --clean"
-    echo ""
-    echo "Model defaults to 'CPU' (your llama.cpp --alias)."
-    echo "Check available models: curl http://100.71.29.121:3002/v1/models"
+    echo "e.g. ./run.sh full --clean"
     echo ""
     echo "Env overrides:"
+    echo "  MODEL=<alias>                         (default: Default) your llama-server's --alias"
     echo "  EDIT_FORMAT=whole|diff|udiff|...      (default: whole) aider's --edit-format;"
     echo "                                        applies to smoke/quick/python/polyglot/full/custom"
     echo "                                        (the diff command always forces diff)"
