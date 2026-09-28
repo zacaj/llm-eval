@@ -429,14 +429,26 @@ TEST_STATS = ['pass', 'passed_at_try', 'tries_taken', 'cost', 'duration',
               'completion_tokens', 'aider_commit']
 write_tsv(per_test_tsv_file, TEST_STATIC, TEST_STATS, per_test_rows)
 
-pass_rate_str = ' '.join(
-    f'{i + 1}:{row[f\"pass_rate_{i + 1}\"]}' for i in range(tries)
-) or '(no tries observed)'
+# Console summary shows NEW passes per try (a delta), not the cumulative
+# pass_rate_N stored in the TSV -- cumulative is the right thing to persist
+# (lets later analysis ask: solved within a budget of N retries?), but as a
+# printed line it's misleading at a glance: once nothing else passes, it just
+# repeats the same percentage for every remaining try (e.g. 16 tries with 1
+# holdout exercise prints '80.0' fourteen times in a row, which reads like a
+# bug even though it's mathematically correct). Trim the trailing all-zero
+# tail so a stuck exercise doesn't pad the line with as many entries as TRIES.
+pass_delta_by_try = [passed_by_try[i] - (passed_by_try[i - 1] if i > 0 else 0) for i in range(tries)]
+last_nonzero = max((i for i in range(tries) if pass_delta_by_try[i] > 0), default=-1)
+if last_nonzero == -1:
+    passed_at_try_str = '(none passed)'
+else:
+    shown = ' '.join(f'{i + 1}:{pass_delta_by_try[i]}' for i in range(last_nonzero + 1))
+    passed_at_try_str = shown if last_nonzero == tries - 1 else f'{shown} (0 more through try {tries})'
 
 print(f'Eval row appended: {tsv_file}')
 print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model}: '
       f'completed={row[\"completed_tests\"]}/{row[\"total_tests\"]} '
-      f'pass_rate%={pass_rate_str} '
+      f'passed={sum(pass_delta_by_try)}/{completed} new-pass-by-try={passed_at_try_str} '
       f'well_formed={row[\"percent_cases_well_formed\"]}% cost=\${row[\"total_cost\"]} '
       f'sec/case={row[\"seconds_per_case\"]}')
 print(f'{len(per_test_rows)} per-test row(s) appended: {per_test_tsv_file}')
