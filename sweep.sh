@@ -38,6 +38,15 @@ set -euo pipefail
 #   qwen3.5-q8       -m /models/Qwen3.5-9B.gguf --alias Qwen3.5 -ctk q8_0 -ctv q8_0     --temp 0.6 --top-p 0.95 --top-k 20 --ctx-size 32768
 #   qwen3.5-turbo3   -m /models/Qwen3.5-9B.gguf --alias Qwen3.5 -ctk q8_0 -ctv turbo3   --temp 0.6 --top-p 0.95 --top-k 20 --ctx-size 32768
 #
+# CONFIGS can ALSO be a comma-separated list of models instead of a
+# configs.txt path, e.g. CONFIGS="Foo.gguf,Bar.gguf" -- each entry is
+# resolved by /mnt/llm/model-configs/mcfg.py in eval mode (rules keyed on
+# the GGUF's own header: arch, MTP head, quant...; see models.yaml there).
+# An entry can carry per-model overrides/overlays after the filename, e.g.
+#   CONFIGS="Foo.gguf +tpl,Foo.gguf -ctv q6_0,Bar.gguf +nomtp"
+# Every resolved config is printed before running; `mcfg explain --mode eval
+# Foo.gguf` shows which rule set each flag. MCFG_MODE overrides the mode.
+#
 # run-cmd is any evals/aider/run.sh command (default: quick — 5 python
 # exercises, a reasonable tradeoff of signal vs. time-per-combo for a sweep).
 # Extra args after `--` are forwarded to run.sh; TRIES/MAX_TOKENS/etc. env
@@ -46,6 +55,25 @@ set -euo pipefail
 # yourself, so a sweep is always independent combo-to-combo by default (see
 # run.sh's auto_clean/guard_reuse — matters for python/full, which don't
 # auto-clean on a plain ./run.sh call).
+#
+# Recipe: gap-fill a model roster + auto seed-2 retry on 100%-failing
+# exercises. run.sh's own SKIP_EXISTING/SEED_TRIES (see its fromfile help)
+# pass straight through here since they're ordinary env vars and this
+# script just execs `MODEL=$ALIAS ./run.sh "$RUN_CMD" ...` per combo:
+#   CONFIGS="ModelA.gguf,ModelB.gguf,ModelC.gguf" \
+#     SKIP_EXISTING=1 SEED_TRIES=2 \
+#     ./sweep.sh fromfile results/some-exercise-list.txt
+# (no trailing -- --clean needed: the exercise-list path is just the next
+# positional arg after run-cmd, and --clean is added automatically since
+# nothing else here already implies --clean/-c/--resume)
+# For each resolved model this runs the exercise list once (dropping
+# anything that's EVER passed before, since SKIP_EXISTING=1), then -- for
+# whatever's still failing after that -- automatically retries with seed 2
+# before moving to the next model, closing out both "never attempted" gaps
+# and "seed got unlucky" gaps in one pass instead of a hand-built one-off
+# driver script per campaign (see the seed2-retry-sweep session this
+# recipe was distilled from: 3 of 4 confirmed-failing exercises across a
+# 6-model roster turned out to just be seed variance).
 #
 # Env vars:
 #   CONFIGS                path to a configs.txt (see format above). Required
@@ -57,14 +85,26 @@ set -euo pipefail
 #   LLAMA_REPO_DIR          path to the llama-cpp-turboquant checkout; only
 #                          used to `docker compose stop llama-cpp` there when
 #                          STOP_EXISTING=1. Default /mnt/llm/llama-cpp-turboquant.
-#   MODELS_DIR/MODELS2_DIR/MODELS3_DIR   host dirs mounted read-only at
-#                          /models, /models2, /models3 in the sweep
-#                          container — must match whatever paths your
-#                          configs' flags reference. Defaults match
-#                          llama-cpp-turboquant/docker-compose.yml's mounts.
+#   MCFG                   path to mcfg.py (default /mnt/llm/model-configs/mcfg.py)
+#   MCFG_MODE=eval         mode CONFIGS=<gguf list> entries resolve in
+#   MODELS_DIR/MODELS2_DIR/MODELS3_DIR   optional host-dir overrides for the
+#                          /models, /models2, /models3 mounts; every /models*
+#                          mount otherwise comes from docker-compose.yml's
+#                          volumes (via `mcfg mounts`).
 #   HEALTH_TIMEOUT=1800    seconds to wait for a combo's server to report
 #                          healthy before giving up on it (model load can be
 #                          slow, especially cold-cache on a big GGUF).
+#   MIN_TPS=0              if >0, after a combo's server reports healthy, run
+#                          a short smoke completion and read its logged
+#                          `tg = N t/s` back; skip the combo (marking it
+#                          failed, same as a run.sh failure) if under this
+#                          threshold instead of committing to a full eval run.
+#                          Catches a bad layer split (e.g. --fit-ctx leaving
+#                          CPU-resident layers a manual --n-gpu-layers/
+#                          --ctx-size split wouldn't) that loads fine and
+#                          passes /health but decodes at a few tok/s for
+#                          hours -- see turboquant-fit-vs-manual-moe-offload
+#                          notes. 0 (default) disables the check.
 #   STOP_EXISTING=0        if 1, automatically stop the persistent llama-cpp
 #                          compose service if it's currently running.
 #                          Otherwise the sweep refuses to start rather than
@@ -83,25 +123,41 @@ trap 'echo; echo "Interrupted -- stopping sweep container." >&2; docker rm -f ai
 
 IMAGE="${IMAGE:-llama-cpp-turboquant-llama-cpp:latest}"
 LLAMA_REPO_DIR="${LLAMA_REPO_DIR:-/mnt/llm/llama-cpp-turboquant}"
-MODELS_DIR="${MODELS_DIR:-/mnt/llm/llama.cpp/models}"
-MODELS2_DIR="${MODELS2_DIR:-/mnt/2508/Backup 2}"
-MODELS3_DIR="${MODELS3_DIR:-/mnt/2508/Archive}"
+MCFG="${MCFG:-/mnt/llm/model-configs/mcfg.py}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-300}"
 STOP_EXISTING="${STOP_EXISTING:-0}"
+MIN_TPS="${MIN_TPS:-0}"
 
 # ── Parse combos: CONFIGS file, or BASE_FLAGS x VARY_FLAG x VARY_VALUES ─────
 
 TAGS=()
 COMBO_FLAGS=()
 
-if [ -n "${CONFIGS:-}" ]; then
-  [ -f "$CONFIGS" ] || { echo "ERROR: CONFIGS file not found: $CONFIGS" >&2; exit 1; }
+if [ -n "${CONFIGS:-}" ] && [ -f "$CONFIGS" ]; then
   while IFS=$'\t' read -r tag flags || [ -n "${tag:-}" ]; do
     [ -z "${tag:-}" ] && continue
     [[ "$tag" == \#* ]] && continue
     TAGS+=("$tag")
     COMBO_FLAGS+=("$flags")
   done < "$CONFIGS"
+elif [ -n "${CONFIGS:-}" ] && [[ "$CONFIGS" == *.gguf* ]]; then
+  IFS=',' read -ra GGUF_LIST <<< "$CONFIGS"
+  for entry in "${GGUF_LIST[@]}"; do
+    read -ra entry_words <<< "$entry"
+    [ "${#entry_words[@]}" -eq 0 ] && continue
+    resolved="$("$MCFG" resolve --mode "${MCFG_MODE:-eval}" --format tsv "${entry_words[@]}")" || {
+      echo "ERROR: failed to resolve a config for '$entry' -- see above." >&2
+      exit 1
+    }
+    tag="${resolved%%$'\t'*}"
+    flags="${resolved#*$'\t'}"
+    echo "Resolved $entry -> --alias $tag: $flags" >&2
+    TAGS+=("$tag")
+    COMBO_FLAGS+=("$flags")
+  done
+elif [ -n "${CONFIGS:-}" ]; then
+  echo "ERROR: CONFIGS='$CONFIGS' is neither an existing file nor a .gguf list." >&2
+  exit 1
 elif [ -n "${VARY_FLAG:-}" ] && [ -n "${VARY_VALUES:-}" ]; then
   : "${BASE_FLAGS:?BASE_FLAGS required when VARY_FLAG/VARY_VALUES are set}"
   VARY_VALUES_NORM="${VARY_VALUES//,/ }"
@@ -147,9 +203,19 @@ if [ -n "$EXISTING" ]; then
   fi
 fi
 
-MOUNT_ARGS=(-v "$MODELS_DIR:/models:ro")
-[ -d "$MODELS2_DIR" ] && MOUNT_ARGS+=(-v "$MODELS2_DIR:/models2:ro")
-[ -d "$MODELS3_DIR" ] && MOUNT_ARGS+=(-v "$MODELS3_DIR:/models3:ro")
+# Same /models* mounts as the compose service (mcfg reads them from
+# docker-compose.yml), so any path mcfg resolves exists in here too.
+# MODELS_DIR/MODELS2_DIR/MODELS3_DIR still override their mount if set.
+MOUNT_ARGS=()
+while IFS=$'\t' read -r host cont; do
+  case "$cont" in
+    /models) host="${MODELS_DIR:-$host}" ;;
+    /models2) host="${MODELS2_DIR:-$host}" ;;
+    /models3) host="${MODELS3_DIR:-$host}" ;;
+  esac
+  MOUNT_ARGS+=(-v "$host:$cont:ro")
+done < <("$MCFG" mounts)
+[ "${#MOUNT_ARGS[@]}" -gt 0 ] || { echo "ERROR: '$MCFG mounts' returned nothing." >&2; exit 1; }
 
 # Combo flag strings are parsed like a shell command line (via eval), so
 # quoting works exactly like it would on a real command line or in
@@ -194,6 +260,31 @@ wait_for_health() {
   done
 }
 
+# Short smoke completion + read the server's own logged `tg = N t/s` back.
+# Returns 1 (skip this combo) if under MIN_TPS or no speed line showed up.
+# Retries the completion itself up to 3x -- seen a 503 "Loading model" moments
+# after /health already reported ok on a big --fit-ctx model, which a bare
+# `curl -sf ... >/dev/null` (ignoring the exit code) silently turns into a
+# false "unknown speed, skip" instead of a real readiness check.
+speed_gate() {
+  local attempt http_code
+  for attempt in 1 2 3; do
+    http_code="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8080/completion" -H 'Content-Type: application/json' -d '{
+      "prompt": "Write a short paragraph about the history of bridges.",
+      "n_predict": 200,
+      "temperature": 0.6
+    }' 2>/dev/null)"
+    [ "$http_code" = "200" ] && break
+    echo "smoke completion attempt $attempt got HTTP ${http_code:-<none>} -- retrying in 10s" >&2
+    sleep 10
+  done
+  sleep 2
+  local tps
+  tps="$(docker logs aider-sweep-llama --since 2m 2>&1 | grep -oE 'tg = *[0-9.]+ t/s' | tail -1 | grep -oE '[0-9.]+')"
+  echo "smoke decode speed: ${tps:-unknown} tok/s (threshold ${MIN_TPS}, last http=${http_code:-<none>})" >&2
+  [ -n "$tps" ] && awk "BEGIN{exit !($tps >= $MIN_TPS)}"
+}
+
 SWEEP_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 FAILED=()
 
@@ -215,6 +306,13 @@ for i in "${!TAGS[@]}"; do
   echo "Waiting for /health (timeout ${HEALTH_TIMEOUT}s)..." >&2
   if ! wait_for_health; then
     FAILED+=("$TAG (server never became healthy)")
+    docker rm -f aider-sweep-llama >/dev/null 2>&1 || true
+    continue
+  fi
+
+  if [ "$MIN_TPS" != "0" ] && ! speed_gate; then
+    echo "SKIPPING $TAG -- decode speed below MIN_TPS=$MIN_TPS threshold, not worth a full run" >&2
+    FAILED+=("$TAG (below MIN_TPS)")
     docker rm -f aider-sweep-llama >/dev/null 2>&1 || true
     continue
   fi

@@ -13,7 +13,13 @@ services:
       - OPENAI_API_KEY=sk-dummy
       - OPENAI_API_BASE=${LLAMA_BASE_URL:-http://100.71.29.121:3002/v1}
       - AIDER_DOCKER=1
+      - CARGO_HOME=/tmp/cargo
       - AIDER_BENCHMARK_DIR=/benchmarks
+      # For MODEL=openrouter/<vendor>/<slug> runs (see run.sh) -- litellm reads
+      # this directly and routes anything with the openrouter/ prefix to
+      # https://openrouter.ai/api/v1 on its own, ignoring OPENAI_API_BASE above.
+      # Empty/unset is harmless for local-server runs that never reference it.
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
     working_dir: /aider
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     tty: true
