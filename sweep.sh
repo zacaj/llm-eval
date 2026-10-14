@@ -5,19 +5,21 @@ set -euo pipefail
 # turn (different models, or the same model with one setting varied, e.g. a
 # few -ctv values) and collects results.
 #
-# Different shape than scripts/perplexity-sweep.sh in llama-cpp-turboquant:
-# that script spins up a throwaway `docker run` per request against the
-# one-shot llama-perplexity binary. llama-server is instead a persistent
-# HTTP service that an aider benchmark run talks to over many requests, so
-# each sweep point here means: stop the previous server container, start a
-# fresh one with this combo's flags, wait for /health, run the eval via
-# ./run.sh (which already tracks results into results/eval-results.tsv —
-# see run.sh's track_eval), tear the server down, move to the next combo.
+# Each sweep point means: swap the persistent llama-cpp-turboquant `llama-cpp`
+# compose service to this combo's config via /mnt/llm/model-configs/mcfg.py
+# (writes docker-compose.override.yml, `docker compose up -d`, blocks until a
+# real completion succeeds -- not just /health, and dies with recent logs on
+# a crash/timeout instead of hanging), run the eval via ./run.sh (which
+# already tracks results into results/eval-results.tsv -- see run.sh's
+# track_eval), move to the next combo.
 #
-# This STOPS your persistent llama-cpp-turboquant `llama-cpp` compose
-# service for the sweep's duration (it needs host port 8080) and does NOT
-# restart it automatically afterward — bring it back yourself when done:
-#   cd /mnt/llm/llama-cpp-turboquant && docker compose up -d llama-cpp
+# This USES your persistent llama-cpp-turboquant `llama-cpp` compose service
+# directly (swapping its config combo-to-combo) rather than a throwaway
+# container, so nothing needs stopping/restarting around the sweep. If it's
+# already serving a request when a combo wants to swap in, mcfg refuses by
+# default (WAIT_IDLE=1 waits for idle instead, FORCE=1 restarts mid-request)
+# -- see WAIT_IDLE/FORCE below. The sweep leaves whatever the LAST combo
+# resolved to running when it finishes.
 #
 # Usage:
 #   CONFIGS=configs.txt ./sweep.sh [run-cmd] [-- extra run.sh args]
@@ -75,41 +77,54 @@ set -euo pipefail
 # recipe was distilled from: 3 of 4 confirmed-failing exercises across a
 # 6-model roster turned out to just be seed variance).
 #
+# Other seed/skip combos (full semantics in `./run.sh --help`, fromfile):
+#   fill every missing seed-2 record, even where seed 1 passed:
+#     SEEDS=2 SEED_ALWAYS=2 SKIP_EXISTING=seed ./sweep.sh fromfile <list>
+#   fill seed 2 only for exercises that never passed at any seed:
+#     SEEDS=2 SKIP_EXISTING=pass,seed ./sweep.sh fromfile <list>
+#   skip only what already passed at the seed being run:
+#     SKIP_EXISTING=seed-pass ./sweep.sh fromfile <list>
+#   scale every exercise's max duration to each model's measured decode speed
+#   (max(1, 100/tok-per-s), probed by run.sh after each combo comes up):
+#     MAX_DUR_SCALE=auto ./sweep.sh fromfile <list>
+#
 # Env vars:
 #   CONFIGS                path to a configs.txt (see format above). Required
 #                          unless BASE_FLAGS + VARY_FLAG + VARY_VALUES are set.
 #   BASE_FLAGS/VARY_FLAG/VARY_VALUES   synthesize a configs.txt-equivalent
 #                          sweep of one flag; see usage above.
-#   IMAGE                  llama-cpp-turboquant server image; default
-#                          llama-cpp-turboquant-llama-cpp:latest
-#   LLAMA_REPO_DIR          path to the llama-cpp-turboquant checkout; only
-#                          used to `docker compose stop llama-cpp` there when
-#                          STOP_EXISTING=1. Default /mnt/llm/llama-cpp-turboquant.
+#   LLAMA_REPO_DIR          path to the llama-cpp-turboquant checkout (holds
+#                          docker-compose.yml, the compose service mcfg
+#                          manages). Default /mnt/llm/llama-cpp-turboquant.
 #   MCFG                   path to mcfg.py (default /mnt/llm/model-configs/mcfg.py)
-#   MCFG_MODE=eval         mode CONFIGS=<gguf list> entries resolve in
-#   MODELS_DIR/MODELS2_DIR/MODELS3_DIR   optional host-dir overrides for the
-#                          /models, /models2, /models3 mounts; every /models*
-#                          mount otherwise comes from docker-compose.yml's
-#                          volumes (via `mcfg mounts`).
-#   HEALTH_TIMEOUT=1800    seconds to wait for a combo's server to report
-#                          healthy before giving up on it (model load can be
-#                          slow, especially cold-cache on a big GGUF).
-#   MIN_TPS=0              if >0, after a combo's server reports healthy, run
-#                          a short smoke completion and read its logged
+#   MCFG_MODE=eval         mode every combo resolves in (rule facts can match
+#                          on --mode; eval is model-configs' benchmark-tuned
+#                          profile set).
+#   HEALTH_TIMEOUT=900     seconds `mcfg use --wait` gets to bring a combo up
+#                          and answer a real completion before giving up
+#                          (mcfg's own default; cold loads off slow drives
+#                          can take ~450s -- see its --timeout).
+#   WAIT_IDLE=0             if 1, and the service is currently mid-request
+#                          when a combo wants to swap in, wait for it to go
+#                          idle instead of refusing (mcfg's --wait-idle).
+#   FORCE=0                 if 1, swap in a combo even if the service is
+#                          currently mid-request, interrupting it (mcfg's
+#                          --force). Takes priority over WAIT_IDLE if both
+#                          are set. Leave both 0 (default) to just refuse and
+#                          let you decide by hand -- don't interrupt or race
+#                          against something else using the server.
+#   MIN_TPS=0              if >0, after a combo comes up (mcfg's --wait
+#                          already confirmed a completion succeeds), run a
+#                          further smoke completion and read the logged
 #                          `tg = N t/s` back; skip the combo (marking it
 #                          failed, same as a run.sh failure) if under this
 #                          threshold instead of committing to a full eval run.
 #                          Catches a bad layer split (e.g. --fit-ctx leaving
 #                          CPU-resident layers a manual --n-gpu-layers/
-#                          --ctx-size split wouldn't) that loads fine and
-#                          passes /health but decodes at a few tok/s for
-#                          hours -- see turboquant-fit-vs-manual-moe-offload
-#                          notes. 0 (default) disables the check.
-#   STOP_EXISTING=0        if 1, automatically stop the persistent llama-cpp
-#                          compose service if it's currently running.
-#                          Otherwise the sweep refuses to start rather than
-#                          silently killing a server something else may be
-#                          relying on.
+#                          --ctx-size split wouldn't) that answers fine but
+#                          decodes at a few tok/s for hours -- see
+#                          turboquant-fit-vs-manual-moe-offload notes. 0
+#                          (default) disables the check.
 #
 # Output: every combo's row lands in results/eval-results.tsv via run.sh's
 # own tracking, tagged with that combo's actual server settings (model,
@@ -119,13 +134,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-trap 'echo; echo "Interrupted -- stopping sweep container." >&2; docker rm -f aider-sweep-llama >/dev/null 2>&1 || true; exit 130' INT TERM
-
-IMAGE="${IMAGE:-llama-cpp-turboquant-llama-cpp:latest}"
+# The model server (llama-cpp-turboquant in docker inside WSL) lives on the NAS,
+# not on this host: LLAMA_REPO_DIR/MCFG are paths ON the NAS, and everything
+# that touches them (mcfg.py, `docker compose`, `docker logs`) runs over ssh.
+# This sweep only drives the llama-nas target; Strata isn't swapped by it.
+NAS_HOST="${NAS_HOST:-192.168.2.15}"
+export TARGET=llama-nas
+nas() { ssh -o BatchMode=yes "$NAS_HOST" "$@"; }
 LLAMA_REPO_DIR="${LLAMA_REPO_DIR:-/mnt/llm/llama-cpp-turboquant}"
 MCFG="${MCFG:-/mnt/llm/model-configs/mcfg.py}"
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-300}"
-STOP_EXISTING="${STOP_EXISTING:-0}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
+WAIT_IDLE="${WAIT_IDLE:-0}"
+FORCE="${FORCE:-0}"
 MIN_TPS="${MIN_TPS:-0}"
 
 # ── Parse combos: CONFIGS file, or BASE_FLAGS x VARY_FLAG x VARY_VALUES ─────
@@ -188,48 +208,9 @@ done
 
 echo "Sweeping ${#TAGS[@]} combo(s) with run-cmd '$RUN_CMD': ${TAGS[*]}" >&2
 
-# ── Make sure port 8080 is free for the sweep's own server ─────────────────
-
-EXISTING="$(docker ps --filter 'name=llama-cpp-turboquant-llama-cpp' --filter status=running --format '{{.Names}}' | head -1)"
-if [ -n "$EXISTING" ]; then
-  if [ "$STOP_EXISTING" = "1" ]; then
-    echo "Stopping persistent llama-cpp service ($EXISTING) to free port 8080 for the sweep..." >&2
-    (cd "$LLAMA_REPO_DIR" && docker compose stop llama-cpp)
-  else
-    echo "ERROR: persistent llama-cpp service is running ($EXISTING) and holds port 8080." >&2
-    echo "Stop it yourself (cd $LLAMA_REPO_DIR && docker compose stop llama-cpp)," >&2
-    echo "or re-run with STOP_EXISTING=1 to have this script stop it for you." >&2
-    exit 1
-  fi
-fi
-
-# Same /models* mounts as the compose service (mcfg reads them from
-# docker-compose.yml), so any path mcfg resolves exists in here too.
-# MODELS_DIR/MODELS2_DIR/MODELS3_DIR still override their mount if set.
-MOUNT_ARGS=()
-while IFS=$'\t' read -r host cont; do
-  case "$cont" in
-    /models) host="${MODELS_DIR:-$host}" ;;
-    /models2) host="${MODELS2_DIR:-$host}" ;;
-    /models3) host="${MODELS3_DIR:-$host}" ;;
-  esac
-  MOUNT_ARGS+=(-v "$host:$cont:ro")
-done < <("$MCFG" mounts)
-[ "${#MOUNT_ARGS[@]}" -gt 0 ] || { echo "ERROR: '$MCFG mounts' returned nothing." >&2; exit 1; }
-
 # Combo flag strings are parsed like a shell command line (via eval), so
 # quoting works exactly like it would on a real command line or in
 # docker-compose.yml's command: block -- e.g. --alias "Gemma 4".
-start_server() {
-  local flags_str="$1" flag_arr
-  eval "flag_arr=($flags_str)"
-  docker rm -f aider-sweep-llama >/dev/null 2>&1 || true
-  docker run -d --rm --name aider-sweep-llama --gpus all -p 8080:8080 \
-    "${MOUNT_ARGS[@]}" \
-    --entrypoint /app/llama-server "$IMAGE" \
-    --host 0.0.0.0 --port 8080 "${flag_arr[@]}" >/dev/null
-}
-
 extract_alias() {
   local flags_str="$1" flag_arr i
   eval "flag_arr=($flags_str)"
@@ -242,51 +223,66 @@ extract_alias() {
   return 1
 }
 
-wait_for_health() {
-  local deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
-  while true; do
-    if ! docker ps --filter 'name=^aider-sweep-llama$' --filter status=running --format '{{.Names}}' | grep -q .; then
-      echo "ERROR: aider-sweep-llama exited before becoming healthy -- check: docker logs aider-sweep-llama" >&2
-      return 1
+# -> prints "MODEL\tREST_FLAGS_STRING" -- pulls the -m/--model value out as
+# mcfg's positional MODEL (it needs a real GGUF to derive facts from), and
+# returns everything else as override flags. Since mcfg's use/resolve apply
+# overrides last ("later contributions override earlier ones"), passing an
+# already-fully-formed flags string back this way is safe and idempotent --
+# it just reasserts exactly what we already have, whether that came from
+# mcfg resolve (CONFIGS=<gguf list>) or a hand-written configs.txt/BASE_FLAGS
+# line.
+split_model_and_rest() {
+  local flags_str="$1" flag_arr i model="" rest=()
+  eval "flag_arr=($flags_str)"
+  for ((i = 0; i < ${#flag_arr[@]}; i++)); do
+    if [[ "${flag_arr[$i]}" == "-m" || "${flag_arr[$i]}" == "--model" ]] && [ -z "$model" ]; then
+      model="${flag_arr[$((i + 1))]}"
+      i=$((i + 1))
+    else
+      rest+=("${flag_arr[$i]}")
     fi
-    if curl -sf "http://localhost:8080/health" >/dev/null 2>&1; then
-      return 0
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "ERROR: timed out after ${HEALTH_TIMEOUT}s waiting for aider-sweep-llama to become healthy" >&2
-      return 1
-    fi
-    sleep 5
   done
+  [ -n "$model" ] || return 1
+  printf '%s\t%s\n' "$model" "$(printf '%q ' "${rest[@]}")"
 }
 
 # Short smoke completion + read the server's own logged `tg = N t/s` back.
-# Returns 1 (skip this combo) if under MIN_TPS or no speed line showed up.
-# Retries the completion itself up to 3x -- seen a 503 "Loading model" moments
-# after /health already reported ok on a big --fit-ctx model, which a bare
-# `curl -sf ... >/dev/null` (ignoring the exit code) silently turns into a
-# false "unknown speed, skip" instead of a real readiness check.
+# mcfg's --wait already confirmed a completion succeeds; this is purely the
+# MIN_TPS speed check on top of that. Returns 1 (skip this combo) if under
+# MIN_TPS or no speed line showed up.
 speed_gate() {
-  local attempt http_code
-  for attempt in 1 2 3; do
-    http_code="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8080/completion" -H 'Content-Type: application/json' -d '{
-      "prompt": "Write a short paragraph about the history of bridges.",
-      "n_predict": 200,
-      "temperature": 0.6
-    }' 2>/dev/null)"
-    [ "$http_code" = "200" ] && break
-    echo "smoke completion attempt $attempt got HTTP ${http_code:-<none>} -- retrying in 10s" >&2
-    sleep 10
-  done
+  local container http_code
+  container="$(nas "cd $(printf %q "$LLAMA_REPO_DIR") && docker compose ps -q llama-cpp")"
+  http_code="$(curl -s -o /dev/null -w '%{http_code}' "http://$NAS_HOST:8080/completion" -H 'Content-Type: application/json' -d '{
+    "prompt": "Write a short paragraph about the history of bridges.",
+    "n_predict": 200,
+    "temperature": 0.6
+  }')"
+  if [ "$http_code" != "200" ]; then
+    echo "smoke decode speed: unknown tok/s (threshold ${MIN_TPS}, completion request got HTTP ${http_code:-<none>})" >&2
+    return 1
+  fi
   sleep 2
   local tps
-  tps="$(docker logs aider-sweep-llama --since 2m 2>&1 | grep -oE 'tg = *[0-9.]+ t/s' | tail -1 | grep -oE '[0-9.]+')"
-  echo "smoke decode speed: ${tps:-unknown} tok/s (threshold ${MIN_TPS}, last http=${http_code:-<none>})" >&2
+  # Non-speculative builds log a plain "tg = N t/s" summary line. Models running
+  # --spec-type draft-mtp (all the 35B-A3B MoE configs) never print that line at
+  # all -- their print_timing summary uses "eval time = ... / N tokens (... M
+  # tokens per second)" instead. Try the normal format first, fall back to the
+  # spec-decode one so those models don't get spuriously skipped as "unknown".
+  tps="$(nas docker logs "$container" --since 2m 2>&1 | grep -oE 'tg = *[0-9.]+ t/s' | tail -1 | grep -oE '[0-9.]+')"
+  if [ -z "$tps" ]; then
+    tps="$(nas docker logs "$container" --since 2m 2>&1 | grep -E 'eval time = ' | grep -v 'prompt eval time' | tail -1 | grep -oE '[0-9.]+ tokens per second' | grep -oE '[0-9.]+')"
+  fi
+  echo "smoke decode speed: ${tps:-unknown} tok/s (threshold ${MIN_TPS})" >&2
   [ -n "$tps" ] && awk "BEGIN{exit !($tps >= $MIN_TPS)}"
 }
 
 SWEEP_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 FAILED=()
+
+BUSY_FLAG=()
+[ "$FORCE" = "1" ] && BUSY_FLAG=(--force)
+[ "$FORCE" != "1" ] && [ "$WAIT_IDLE" = "1" ] && BUSY_FLAG=(--wait-idle)
 
 for i in "${!TAGS[@]}"; do
   TAG="${TAGS[$i]}"
@@ -300,31 +296,37 @@ for i in "${!TAGS[@]}"; do
     continue
   }
 
-  echo "Starting server: $FLAGS" >&2
-  start_server "$FLAGS"
+  split="$(split_model_and_rest "$FLAGS")" || {
+    echo "ERROR: combo '$TAG' has no -m/--model in its flags -- skipping." >&2
+    FAILED+=("$TAG (no -m)")
+    continue
+  }
+  MODEL="${split%%$'\t'*}"
+  REST_STR="${split#*$'\t'}"
+  eval "REST_ARR=($REST_STR)"
 
-  echo "Waiting for /health (timeout ${HEALTH_TIMEOUT}s)..." >&2
-  if ! wait_for_health; then
-    FAILED+=("$TAG (server never became healthy)")
-    docker rm -f aider-sweep-llama >/dev/null 2>&1 || true
+  echo "Bringing up $ALIAS (mcfg use, timeout ${HEALTH_TIMEOUT}s) -- full command below" >&2
+  if ! nas "cd $(printf %q "$LLAMA_REPO_DIR") && $(printf %q "$MCFG") use --mode $(printf %q "${MCFG_MODE:-eval}") --up --wait \
+      --timeout $(printf %q "$HEALTH_TIMEOUT") $(printf '%q ' "${BUSY_FLAG[@]}" "$MODEL" "${REST_ARR[@]}")"; then
+    echo "ERROR: mcfg use failed for combo '$TAG' -- see its output above." >&2
+    FAILED+=("$TAG (mcfg use failed)")
     continue
   fi
 
   if [ "$MIN_TPS" != "0" ] && ! speed_gate; then
     echo "SKIPPING $TAG -- decode speed below MIN_TPS=$MIN_TPS threshold, not worth a full run" >&2
     FAILED+=("$TAG (below MIN_TPS)")
-    docker rm -f aider-sweep-llama >/dev/null 2>&1 || true
     continue
   fi
 
   echo "Running: MODEL=$ALIAS ./run.sh $RUN_CMD ${EXTRA_RUN_ARGS[*]}" >&2
-  if ! LLAMA_BASE_URL="http://host.docker.internal:8080/v1" LLAMA_CONTAINER="aider-sweep-llama" \
+  # Direct to the NAS's published :8080 (not the localhost of the aider
+  # container, and bypassing the :3002 prompt-router/logger proxy).
+  if ! LLAMA_BASE_URL="http://$NAS_HOST:8080/v1" \
       MODEL="$ALIAS" ./run.sh "$RUN_CMD" "${EXTRA_RUN_ARGS[@]}"; then
     echo "ERROR: ./run.sh failed for combo '$TAG'" >&2
     FAILED+=("$TAG (run.sh failed)")
   fi
-
-  docker rm -f aider-sweep-llama >/dev/null 2>&1 || true
 done
 
 # ── Summary: just this sweep's rows out of the shared eval-results.tsv ─────
@@ -358,7 +360,6 @@ if [ "${#FAILED[@]}" -gt 0 ]; then
 else
   echo "Sweep finished, all ${#TAGS[@]} combo(s) ran." >&2
 fi
-echo "Your persistent llama-cpp service was NOT restarted -- bring it back with:" >&2
-echo "  cd $LLAMA_REPO_DIR && docker compose up -d llama-cpp" >&2
+echo "The persistent llama-cpp service is left running whatever the last combo resolved to." >&2
 
 [ "${#FAILED[@]}" -eq 0 ]

@@ -61,8 +61,55 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# ── Target server ───────────────────────────────────────────────────────────
+# This eval host is NOT the machine running the model server any more. TARGET
+# picks which remote server a run talks to; each sets the OpenAI base URL the
+# aider containers use, the /health URL used for probes, and how server
+# settings get recorded into the TSVs:
+#   llama-nas  llama.cpp in docker inside WSL on the NAS. Requests go through
+#              the :3002 prompt-logger proxy (as before); health/probes hit
+#              :8080 directly. srv.* columns come from `docker inspect` over
+#              ssh://$NAS_HOST.
+#   strata     Strata (Qwen3.8-Flash-Next engine) on the NAS's Windows host,
+#              over its own tailscale address. No container to inspect, so
+#              srv.* columns come from its /props endpoint instead.
+# LLAMA_BASE_URL / LLAMA_SERVER_URL / LLAMA_HEALTH_URL still override.
+TARGET="${TARGET:-llama-nas}"
+NAS_HOST="${NAS_HOST:-192.168.2.15}"          # WSL ssh on :22 (docker lives here)
+STRATA_URL="${STRATA_URL:-http://100.94.194.48:8080}"
+LLAMA_DOCKER=()                                # docker CLI prefix for the model server's host
+case "$TARGET" in
+  llama-nas)
+    LLAMA_SERVER_URL="${LLAMA_SERVER_URL:-http://$NAS_HOST:8080}"
+    LLAMA_BASE_URL="${LLAMA_BASE_URL:-http://$NAS_HOST:3002/v1}"
+    LLAMA_DOCKER=(docker -H "ssh://$NAS_HOST")
+    ;;
+  strata)
+    LLAMA_SERVER_URL="${LLAMA_SERVER_URL:-$STRATA_URL}"
+    LLAMA_BASE_URL="${LLAMA_BASE_URL:-$LLAMA_SERVER_URL/v1}"
+    ;;
+  *)
+    echo "ERROR: TARGET='$TARGET' is not one of llama-nas|strata." >&2
+    exit 1
+    ;;
+esac
+LLAMA_HEALTH_URL="${LLAMA_HEALTH_URL:-$LLAMA_SERVER_URL/health}"
+export LLAMA_BASE_URL    # read by docker-compose.yml as OPENAI_API_BASE
+
 CMD="${1:-help}"
-MODEL="${MODEL:-Qwen3.6-35B-A3B}"  # your llama-server's --alias; NOT a positional arg (see header).
+# Strata serves whatever one model it has loaded under its own alias (any
+# name is accepted); default MODEL to that so the TSV `model` column says
+# which model actually ran, instead of the llama default below.
+_DEFAULT_MODEL="Qwen3.6-35B-A3B"
+if [[ "$TARGET" == "strata" && -z "${MODEL:-}" && "$CMD" != "help" ]]; then
+  _DEFAULT_MODEL="$(curl -sf --max-time 10 "$LLAMA_SERVER_URL/v1/models" 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)" || _DEFAULT_MODEL=""
+  if [[ -z "$_DEFAULT_MODEL" ]]; then
+    echo "ERROR: TARGET=strata but couldn't read a model id from $LLAMA_SERVER_URL/v1/models (is it up/exposed?). Set MODEL= explicitly to skip this." >&2
+    exit 1
+  fi
+fi
+MODEL="${MODEL:-$_DEFAULT_MODEL}"  # your llama-server's --alias; NOT a positional arg (see header).
                                     # Every model swapped into docker-compose.yml's active block
                                     # gets aliased to this same string regardless of actual weights
                                     # (see llama-cpp-turboquant/docker-compose.yml), so this rarely
@@ -85,6 +132,45 @@ fi
 # same time -- never share a path and clobber each other's state.
 MODEL_SLUG="$(echo "$AIDER_MODEL" | tr '/:' '--')"
 REASONING_EFFORT="${REASONING_EFFORT-low}"  # empty string disables
+# The effort level is a bundle, not just the --reasoning-effort hint: the
+# Qwen3.8 template turns it into a system-prompt sentence, so a model asked for
+# more effort thinks longer -- and then needs a bigger thinking cap, token cap
+# and wall-clock allowance or it just gets truncated/timed out. 'low' is the
+# baseline every earlier result was run at (4k thinking, 16k tokens, 1x
+# timeouts); the others scale from it. The numbers are a first guess -- tune
+# them after seeing a real run. Each can still be set explicitly:
+#   REASONING_BUDGET   thinking-token cap sent PER REQUEST (llama-server's
+#                      reasoning_budget_tokens), so no server restart is needed.
+#                      Empty = don't send, the server's --reasoning-budget applies.
+#                      (-1 can't mean "unlimited" per request -- the server reads
+#                      it as "unset"; use a big number.) Ignored for MODEL=x/y
+#                      remote specs: OpenRouter has OR_REASONING_TOKENS instead.
+#   MAX_TOKENS         total generation cap (thinking + answer), below
+#   EFFORT_DUR_MULT    extra multiplier on every max_dur, stacks with MAX_DUR_SCALE
+# REQUEST_TIMEOUT already follows MAX_TOKENS, so it scales with no extra knob.
+[[ "$REASONING_EFFORT" == "high" ]] && REASONING_EFFORT=xhigh   # the template treats them the same
+case "${REASONING_EFFORT:-low}" in
+  low)    _EFFORT_BUDGET=4096;  _EFFORT_MAX_TOKENS=16000; _EFFORT_DUR_MULT=1 ;;
+  medium) _EFFORT_BUDGET=8192;  _EFFORT_MAX_TOKENS=20000; _EFFORT_DUR_MULT=1.5 ;;
+  xhigh)  _EFFORT_BUDGET=16384; _EFFORT_MAX_TOKENS=32000; _EFFORT_DUR_MULT=2.5 ;;
+  *)
+    echo "ERROR: REASONING_EFFORT='$REASONING_EFFORT' is not one of low|medium|xhigh (high = xhigh)." >&2
+    exit 1
+    ;;
+esac
+REASONING_BUDGET="${REASONING_BUDGET-$_EFFORT_BUDGET}"
+EFFORT_DUR_MULT="${EFFORT_DUR_MULT:-$_EFFORT_DUR_MULT}"
+# Non-low runs get their own results dir / settings file (appended to
+# SAMPLING_SLUG below); low keeps the old names so existing dirs still resolve.
+EFFORT_SLUG=""
+[[ -n "$REASONING_EFFORT" && "$REASONING_EFFORT" != "low" ]] && EFFORT_SLUG="-${REASONING_EFFORT}"
+# OpenRouter-only knobs, sent via extra_params.extra_body in the model-settings YAML.
+# OR_PROVIDER: comma-separated provider order, e.g. "DeepInfra" or "DeepInfra,Together"
+#   (pinned with allow_fallbacks=false so a silent fallback can't change quantization).
+# OR_REASONING_TOKENS: exact thinking budget (reasoning.max_tokens); OpenRouter accepts
+#   effort OR max_tokens, not both, so set REASONING_EFFORT= (empty) when using this.
+OR_PROVIDER="${OR_PROVIDER:-}"
+OR_REASONING_TOKENS="${OR_REASONING_TOKENS:-}"
 EDIT_FORMAT="${EDIT_FORMAT:-whole}"         # whole|diff|udiff|... forwarded as aider's --edit-format
                                              # (applies to smoke/quick/python/polyglot/full/custom;
                                              # the dedicated `diff` command always forces diff, that's its purpose)
@@ -109,7 +195,7 @@ TRIES="${TRIES:-6}"                         # fix-up attempts per exercise (defa
                                              # negatives; 6 matches the baseline methodology used across
                                              # every model comparison so far -- see shortlist-*.txt's own
                                              # "passed_at_try/6" annotations)
-MAX_TOKENS="${MAX_TOKENS:-16000}"           # hard cap on thinking+answer tokens
+MAX_TOKENS="${MAX_TOKENS:-$_EFFORT_MAX_TOKENS}"  # hard cap on thinking+answer tokens (default 16000 at low; see REASONING_EFFORT)
                                              # (6-8k caps truncated legitimate answers on some
                                              # exercises: needed as low as ~4243/try to as much as
                                              # 8486 total observed. 16k gives real headroom to avoid
@@ -127,10 +213,16 @@ MAX_TOKENS="${MAX_TOKENS:-16000}"           # hard cap on thinking+answer tokens
 # pass/fails). top-p/top-k/min-p aren't sent, so the server's own flags apply
 # (captured as srv.--top-p etc. in the TSVs). TEMPERATURE=0 restores the old
 # greedy behavior; SEED then has no effect.
-TEMPERATURE="${TEMPERATURE:-0.6}"
+# TEMPERATURE=server sends no temperature at all (aider's use_temperature: false),
+# so the server's own sampling defaults apply -- the default for Strata, whose
+# recommended sampling lives in its run config (read back via /config, see
+# capture_strata_settings). llama keeps 0.6 so existing rows stay comparable.
+_DEFAULT_TEMPERATURE=0.6
+[[ "$TARGET" == "strata" ]] && _DEFAULT_TEMPERATURE=server
+TEMPERATURE="${TEMPERATURE:-$_DEFAULT_TEMPERATURE}"
 SEED="${SEED:-1}"
-if ! [[ "$TEMPERATURE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-  echo "ERROR: TEMPERATURE='$TEMPERATURE' is not a non-negative number." >&2
+if ! [[ "$TEMPERATURE" =~ ^([0-9]+(\.[0-9]+)?|server)$ ]]; then
+  echo "ERROR: TEMPERATURE='$TEMPERATURE' is not a non-negative number or 'server'." >&2
   exit 1
 fi
 if ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
@@ -139,7 +231,7 @@ if ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
 fi
 # Part of every per-run file path (model-settings YAML, fromfile's results
 # dir) so runs of the same model at different seeds never share a dir.
-SAMPLING_SLUG="temp${TEMPERATURE}-seed${SEED}"
+SAMPLING_SLUG="temp${TEMPERATURE}-seed${SEED}${EFFORT_SLUG}"
 DECODE_TPS="${DECODE_TPS:-25}"              # assumed tok/s, for timeout auto-calc -- kept conservative
                                              # since it needs to cover the slowest configs tested (partial
                                              # CPU-offload "-fit on" models can run ~25-30 tok/s), not just
@@ -169,9 +261,65 @@ MAX_DUR="${MAX_DUR:-480}"
 # `MAX_DUR_SCALE=2.5 ./run.sh ...` once, rather than hand-multiplying every
 # line of every shortlist file. 1 = no change (default). Applied at both
 # AIDER_BENCHMARK_MAX_DUR export points below via scale_max_dur().
+#
+# MAX_DUR_SCALE=auto: the MAX_DUR values (here and in the shortlist files) were
+# tuned against a ~100-120 tok/s model, so they're too tight for a slower one.
+# auto probes the live server's decode speed once per run.sh invocation and
+# sets scale = max(1, AUTO_SCALE_BASE_TPS / measured), AUTO_SCALE_BASE_TPS
+# default 100 -- never below 1x, so a fast model keeps the stock limits. It
+# only corrects for decode speed, not for how many tokens a model chooses to
+# generate; the MAX_DUR values themselves already carry that fuzz. If the
+# probe fails it warns and falls back to 1.
 MAX_DUR_SCALE="${MAX_DUR_SCALE:-1}"
+AUTO_SCALE_BASE_TPS="${AUTO_SCALE_BASE_TPS:-100}"
 scale_max_dur() {
-  awk -v d="$1" -v s="$MAX_DUR_SCALE" 'BEGIN { printf "%.0f", d * s }'
+  local s="$MAX_DUR_SCALE"
+  [[ "$s" == "auto" ]] && s=1   # not yet resolved (see resolve_auto_max_dur_scale)
+  awk -v d="$1" -v s="$s" -v m="$EFFORT_DUR_MULT" 'BEGIN { printf "%.0f", d * s * m }'
+}
+
+# Decode tok/s of the live server: two 200-token completions (the first pays
+# one-time warmup), reading llama-server's own timings.predicted_per_second
+# from the response -- unlike scraping docker logs this works for spec-decode
+# builds too. Prints nothing if the server can't answer.
+measure_decode_tps() {
+  # Strata has no /completion; its /metrics already holds decode speed from
+  # real requests (totals since start, else the live mean), so no probe load.
+  if [[ "$TARGET" == "strata" ]]; then
+    curl -sf --max-time 10 "$LLAMA_SERVER_URL/metrics" 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+t = d.get("totals", {})
+if t.get("decode_ms") and t.get("output_tokens"):
+    print(t["output_tokens"] / (t["decode_ms"] / 1000))
+elif d.get("live", {}).get("tok_s_mean"):
+    print(d["live"]["tok_s_mean"])
+' 2>/dev/null
+    return 0
+  fi
+  local url="$LLAMA_HEALTH_URL" i out tps=""
+  url="${url%/health}/completion"
+  for i in 1 2; do
+    out="$(curl -sf --max-time 180 "$url" -H 'Content-Type: application/json' \
+      -d '{"prompt":"Write a short paragraph about the history of bridges.","n_predict":200,"temperature":0.6}' 2>/dev/null \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin)["timings"]["predicted_per_second"])' 2>/dev/null)" || out=""
+    [[ -n "$out" ]] && tps="$out"
+  done
+  echo "$tps"
+}
+
+resolve_auto_max_dur_scale() {
+  [[ "$MAX_DUR_SCALE" == "auto" ]] || return 0
+  local tps
+  tps="$(measure_decode_tps)"
+  if [[ -z "$tps" ]] || ! awk -v t="$tps" 'BEGIN { exit !(t > 0) }'; then
+    echo "WARNING: MAX_DUR_SCALE=auto couldn't measure decode speed (server not answering?) -- using 1x" >&2
+    MAX_DUR_SCALE=1
+  else
+    MAX_DUR_SCALE="$(awk -v t="$tps" -v b="$AUTO_SCALE_BASE_TPS" 'BEGIN { s = b / t; if (s < 1) s = 1; printf "%.2f", s }')"
+    echo "-- MAX_DUR_SCALE=auto: decode ${tps} tok/s vs ${AUTO_SCALE_BASE_TPS} baseline -> ${MAX_DUR_SCALE}x (min 1x)" >&2
+  fi
+  export AIDER_BENCHMARK_MAX_DUR="$(scale_max_dur "$MAX_DUR")"
 }
 
 # Raises aider's ChatSummary trigger (main_model.max_chat_history_tokens,
@@ -238,7 +386,7 @@ detect_llama_container() {
   fi
   local pattern found
   for pattern in "llama-cpp-turboquant-llama-cpp-1" "llama-server" "llama-cpp" "llama"; do
-    found="$(docker ps --filter "name=$pattern" --filter "status=running" --format '{{.Names}}' | head -1)"
+    found="$("${LLAMA_DOCKER[@]}" ps --filter "name=$pattern" --filter "status=running" --format '{{.Names}}' | head -1)"
     if [[ -n "$found" ]]; then
       echo "$found"
       return
@@ -264,13 +412,52 @@ SRV_BLACKLIST="--server --host --port -lv --log-timestamps --log-colors --verbos
 
 
 
+# Strata has no container to `docker inspect`, so its settings come from three
+# endpoints: /props (model identity), /metrics .engine (KV-cache type etc.) and
+# /config (the run config's sampling defaults). Keys reuse llama's flag names
+# where they mean the same thing so rows stay comparable/filterable. Only
+# behavior-affecting engine fields are kept (perf-only ones -- expert cache,
+# arena, workers, PCIe, VRAM -- are dropped, same as SRV_BLACKLIST does for
+# llama). Sampling: an absent config value means the server falls back to the
+# engine default, which is greedy (serve/server.py), so that is recorded as
+# --temp=0 rather than left blank. Best-effort: every fetch is a silent no-op
+# if the server doesn't answer.
+capture_strata_settings() {
+  local props metrics cfg
+  props="$(curl -sf --max-time 10 "$LLAMA_SERVER_URL/props" 2>/dev/null)" || props="{}"
+  metrics="$(curl -sf --max-time 10 "$LLAMA_SERVER_URL/metrics" 2>/dev/null)" || metrics="{}"
+  cfg="$(curl -sf --max-time 10 "$LLAMA_SERVER_URL/config" 2>/dev/null)" || cfg="{}"
+  python3 -c '
+import json, sys
+def load(s):
+    try: return json.loads(s)
+    except Exception: return {}
+props, metrics, cfg = (load(a) for a in sys.argv[1:4])
+out = {}
+path = props.get("model_path", "")
+if path: out["srv.-m"] = path.replace("\\", "/").rsplit("/", 1)[-1]
+if props.get("model_alias"): out["srv.--alias"] = props["model_alias"]
+if props.get("build_info"): out["srv.build_info"] = props["build_info"]
+eng = metrics.get("engine", {})
+for src, dst in (("context", "srv.--ctx-size"), ("kv", "srv.kv_cache"),
+                 ("logit_bias", "srv.logit_bias"), ("spec_min_p", "srv.spec_min_p")):
+    if eng.get(src) is not None: out[dst] = eng[src]
+vals = {k["key"]: k.get("value") for k in cfg.get("keys", [])}
+for src, dst in (("sampling.temperature", "srv.--temp"), ("sampling.top_p", "srv.--top-p"),
+                 ("sampling.top_k", "srv.--top-k"), ("sampling.min_p", "srv.--min-p")):
+    if vals.get(src) is not None: out[dst] = vals[src]
+if "srv.--temp" not in out and cfg: out["srv.--temp"] = 0   # engine default is greedy
+for k, v in out.items(): print(f"{k}={v}")
+' "$props" "$metrics" "$cfg" 2>/dev/null || true
+}
+
 # Extract non-blacklisted llama-server CLI args as key=value lines
 # (prefixed srv.<flag>=<value>). Best-effort: silent no-op if no server
 # container is running.
 capture_srv_settings() {
   local container="$1" inspect_json
   [[ -z "$container" ]] && return
-  inspect_json="$(docker inspect "$container" 2>/dev/null)" || return
+  inspect_json="$("${LLAMA_DOCKER[@]}" inspect "$container" 2>/dev/null)" || return
   [[ -z "$inspect_json" ]] && return
   echo "$inspect_json" | python3 -c "
 import json, sys, re
@@ -466,7 +653,7 @@ print(max_mtime)
 " "$PER_TEST_TSV" "$run_dir" "$cmd_name" "$AIDER_MODEL" "$srv_file" "$since_ts" \
       "edit_format=$edit_format" "tries=$TRIES" "max_tokens=$MAX_TOKENS" \
       "reasoning_effort=$REASONING_EFFORT" "request_timeout=$REQUEST_TIMEOUT" \
-      "temperature=$TEMPERATURE" "seed=$SEED"
+      "target=$TARGET" "temperature=$TEMPERATURE" "seed=$SEED" "or_provider=$OR_PROVIDER" "or_reasoning_tokens=$OR_REASONING_TOKENS"
 }
 
 # Aggregate summary row over the FULL run range [since_ts, now] into
@@ -628,7 +815,7 @@ else:
     passed_at_try_str = shown if last_nonzero == tries - 1 else f'{shown} (0 more through try {tries})'
 
 print(f'Eval row appended: {tsv_file}')
-print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model}: '
+print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model} seed={row[\"seed\"]}: '
       f'completed={row[\"completed_tests\"]}/{row[\"total_tests\"]} '
       f'passed={sum(pass_delta_by_try)}/{completed} new-pass-by-try={passed_at_try_str} '
       f'well_formed={row[\"percent_cases_well_formed\"]}% cost=\${row[\"total_cost\"]} '
@@ -636,7 +823,7 @@ print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model}: '
 " "$TRACK_TSV" "$run_dir" "$cmd_name" "$AIDER_MODEL" "$srv_file" "$since_ts" \
       "edit_format=$edit_format" "tries=$TRIES" "max_tokens=$MAX_TOKENS" \
       "reasoning_effort=$REASONING_EFFORT" "request_timeout=$REQUEST_TIMEOUT" \
-      "temperature=$TEMPERATURE" "seed=$SEED"
+      "target=$TARGET" "temperature=$TEMPERATURE" "seed=$SEED" "or_provider=$OR_PROVIDER" "or_reasoning_tokens=$OR_REASONING_TOKENS"
 }
 
 # Runs benchmark.py in the background, polling every POLL_INTERVAL seconds
@@ -679,10 +866,26 @@ run_benchmark_and_track() {
   shift 3
 
   local container srv_file
-  container="$(detect_llama_container)"
   srv_file="$(mktemp)"
   _CURRENT_SRV_FILE="$srv_file"
-  capture_srv_settings "$container" > "$srv_file"
+  # MODEL with a '/' bypasses the local llama-server (e.g. openrouter/...), so
+  # whatever container happens to be running isn't serving this run -- leave
+  # srv_file empty rather than record its unrelated alias/flags as srv.* columns.
+  if [[ "$MODEL" != */* ]]; then
+    if [[ "$TARGET" == "strata" ]]; then
+      capture_strata_settings > "$srv_file"
+    else
+      container="$(detect_llama_container)"
+      capture_srv_settings "$container" > "$srv_file"
+    fi
+    # The server flag is only the fallback; the per-request budget is what the
+    # model actually ran under, so record that in the same column. Keeps one
+    # column meaning "thinking cap in effect" across old and new rows.
+    if [[ -n "$(local_reasoning_budget)" ]]; then
+      sed -i '/^srv\.--reasoning-budget=/d' "$srv_file"
+      echo "srv.--reasoning-budget=$(local_reasoning_budget)" >> "$srv_file"
+    fi
+  fi
 
   $DOCKER_RUN ./benchmark/benchmark.py "$@" &
   local docker_pid=$!
@@ -827,6 +1030,13 @@ validate_exercises() {
   done
 }
 
+# The per-request thinking budget, or nothing: only local runs (MODEL without a
+# '/') talk to a llama-server that understands reasoning_budget_tokens.
+local_reasoning_budget() {
+  [[ "$MODEL" == */* ]] && return 0
+  printf '%s' "$REASONING_BUDGET"
+}
+
 write_model_settings() {
   local fmt="${1:-$EDIT_FORMAT}"
   # Per-model filename (not a single shared results/.model-settings.yml) so
@@ -837,18 +1047,40 @@ write_model_settings() {
   # not "openai/$MODEL" -- for a MODEL already containing '/' (e.g.
   # openrouter/<vendor>/<slug>), the old hardcoded openai/ prefix never
   # matched the real model name, so extra_params silently never applied.
-  cat > "results/.model-settings-${MODEL_SLUG}-${SAMPLING_SLUG}.yml" <<EOF
+  local f="results/.model-settings-${MODEL_SLUG}-${SAMPLING_SLUG}.yml"
+  cat > "$f" <<EOF
 - name: $AIDER_MODEL
   edit_format: $fmt
   use_repo_map: false
   use_system_prompt: true
   streaming: false
-  extra_params:
-    timeout: $REQUEST_TIMEOUT
-    max_tokens: $MAX_TOKENS
-    temperature: $TEMPERATURE
-    seed: $SEED
 EOF
+  # use_temperature: false stops aider sending any temperature (its default is
+  # temperature=0, which would override the server's sampling defaults).
+  if [[ "$TEMPERATURE" == "server" ]]; then
+    echo "  use_temperature: false" >> "$f"
+  fi
+  {
+    echo "  extra_params:"
+    echo "    timeout: $REQUEST_TIMEOUT"
+    echo "    max_tokens: $MAX_TOKENS"
+    [[ "$TEMPERATURE" != "server" ]] && echo "    temperature: $TEMPERATURE"
+    echo "    seed: $SEED"
+  } >> "$f"
+  if [[ -n "$OR_PROVIDER" || -n "$OR_REASONING_TOKENS" || -n "$(local_reasoning_budget)" ]]; then
+    echo "    extra_body:" >> "$f"
+    if [[ -n "$(local_reasoning_budget)" ]]; then
+      echo "      reasoning_budget_tokens: $(local_reasoning_budget)" >> "$f"
+    fi
+    if [[ -n "$OR_PROVIDER" ]]; then
+      local order
+      order="[$(echo "$OR_PROVIDER" | sed 's/[^,]\+/"&"/g; s/,/, /g')]"
+      echo "      provider: {order: $order, allow_fallbacks: false}" >> "$f"
+    fi
+    if [[ -n "$OR_REASONING_TOKENS" ]]; then
+      echo "      reasoning: {max_tokens: $OR_REASONING_TOKENS}" >> "$f"
+    fi
+  fi
 }
 
 # Common flags shared by every benchmark invocation
@@ -1125,6 +1357,13 @@ run_python_subset() {
 }
 
 case "$CMD" in
+  smoke|quick|diff|python|polyglot|full|fromfile|custom)
+    echo "-- reasoning effort '${REASONING_EFFORT:-<unset>}': thinking budget ${REASONING_BUDGET:-<server default>}$([[ "$MODEL" == */* ]] && echo ' (not sent: remote model)'), MAX_TOKENS ${MAX_TOKENS}, request timeout ${REQUEST_TIMEOUT}s, max_dur x${EFFORT_DUR_MULT}" >&2
+    resolve_auto_max_dur_scale
+    ;;
+esac
+
+case "$CMD" in
   build)
     docker compose build
     ;;
@@ -1282,20 +1521,42 @@ case "$CMD" in
       exit 1
     fi
 
-    # SKIP_EXISTING=1: drop exercises this alias has ALREADY passed, checked
-    # against the whole results history (any prior run/seed), not just this
-    # invocation's own run dir -- "has this model ever solved this one" is
-    # the useful question for a gap-fill/resume run, not "did this exact
-    # seed's run dir solve it". SEED_TRIES=N: after running with the base
-    # SEED, re-check what's still not passing and retry just that subset
-    # with the next seed, up to N seeds total, stopping as soon as nothing's
-    # left. Generalizes what used to be a one-off external "retry failures
-    # with SEED=2" script into a first-class run.sh feature -- and combined
-    # with SKIP_EXISTING, also doubles as mid-run-crash recovery: re-invoking
-    # the same `fromfile` command after a dead server killed some groups
-    # (see the pre-flight health check below) just skips what already passed
-    # and re-attempts what didn't, no separate "recovery pass" concept needed.
+    # Skip + seed controls for `fromfile` (all env vars; see --help):
+    #
+    # SKIP_EXISTING picks WHICH finished work is skipped, checked against the
+    # whole results history (PER_TEST_TSV), not just this run's own dir. A
+    # comma list of scopes, any match skips:
+    #   pass       passed at ANY seed -- "has this model ever solved this one"
+    #   seed-pass  passed at THIS seed only
+    #   seed       has a real attempt (pass or fail) at THIS seed -- resumes a
+    #              crashed run without redoing what already failed at this seed
+    #   resume     = pass,seed (what SKIP_EXISTING=1 has always meant)
+    #   0 / none   skip nothing (default)
+    # Stall bail-outs (bailed_on_max_duration=true) never count as attempts.
+    #
+    # Seeds: SEED=N (default 1) + SEED_TRIES=K runs seeds N..N+K-1; SEEDS=
+    # ("2", "1 3", "1-3", "1,2") names them explicitly and wins over both.
+    # Every seed except the LOWEST in the list is "gated": it only runs
+    # exercises that haven't passed at any seed yet (the point of retrying
+    # with a new seed). SEED_ALWAYS lifts that gate for the listed seeds
+    # ("2", "2 3", or "all") so they run regardless of earlier passes -- e.g.
+    # SEEDS=2 SEED_ALWAYS=2 SKIP_EXISTING=seed fills every missing seed-2
+    # record; drop SEED_ALWAYS and use SKIP_EXISTING=pass to fill only the
+    # exercises that never passed. A lone/lowest seed is never gated, so use
+    # SKIP_EXISTING=pass there if you want fail-only.
     SKIP_EXISTING="${SKIP_EXISTING:-0}"
+    SKIP_PASS=0; SKIP_SEED_PASS=0; SKIP_SEED_TRIED=0
+    _skip_tokens="${SKIP_EXISTING//,/ }"
+    for _t in $_skip_tokens; do
+      case "$_t" in
+        0|none) ;;
+        1|resume) SKIP_PASS=1; SKIP_SEED_TRIED=1 ;;
+        pass) SKIP_PASS=1 ;;
+        seed-pass) SKIP_SEED_PASS=1 ;;
+        seed) SKIP_SEED_TRIED=1 ;;
+        *) echo "ERROR: SKIP_EXISTING token '$_t' invalid (use 0|none, pass, seed-pass, seed, resume/1; comma-separated)." >&2; exit 1 ;;
+      esac
+    done
     SEED_TRIES="${SEED_TRIES:-1}"
     if ! [[ "$SEED_TRIES" =~ ^[0-9]+$ ]] || [[ "$SEED_TRIES" -lt 1 ]]; then
       echo "ERROR: SEED_TRIES='$SEED_TRIES' must be a positive integer." >&2
@@ -1303,49 +1564,119 @@ case "$CMD" in
     fi
     BASE_SEED="$SEED"
 
+    SEED_LIST=()
+    if [[ -n "${SEEDS:-}" ]]; then
+      for _t in ${SEEDS//,/ }; do
+        if [[ "$_t" =~ ^[0-9]+$ ]]; then
+          SEED_LIST+=("$_t")
+        elif [[ "$_t" =~ ^([0-9]+)-([0-9]+)$ && "${BASH_REMATCH[1]}" -le "${BASH_REMATCH[2]}" ]]; then
+          for (( _s=BASH_REMATCH[1]; _s<=BASH_REMATCH[2]; _s++ )); do SEED_LIST+=("$_s"); done
+        else
+          echo "ERROR: SEEDS token '$_t' invalid (use N, N-M, space/comma separated)." >&2
+          exit 1
+        fi
+      done
+    else
+      for (( _s=BASE_SEED; _s<BASE_SEED+SEED_TRIES; _s++ )); do SEED_LIST+=("$_s"); done
+    fi
+    SEED_MIN="${SEED_LIST[0]}"
+    for _s in "${SEED_LIST[@]}"; do [[ "$_s" -lt "$SEED_MIN" ]] && SEED_MIN="$_s"; done
+    SEED_ALWAYS_ALL=0
+    declare -A SEED_ALWAYS_SET=()
+    _always_tokens="${SEED_ALWAYS:-}"
+    for _t in ${_always_tokens//,/ }; do
+      if [[ "$_t" == "all" ]]; then
+        SEED_ALWAYS_ALL=1
+      elif [[ "$_t" =~ ^[0-9]+$ ]]; then
+        SEED_ALWAYS_SET[$_t]=1
+      else
+        echo "ERROR: SEED_ALWAYS token '$_t' invalid (use seed numbers or 'all')." >&2
+        exit 1
+      fi
+    done
+
     # already_passed <exercise-keyword>: true if $MODEL has EVER recorded a
-    # pass for this exercise in PER_TEST_TSV, any run_cmd/seed. Keyword is
+    # pass for this exercise at the current $REASONING_EFFORT in PER_TEST_TSV
+    # (an xhigh pass is a different result from a low one), any run_cmd/seed. Keyword is
     # "<lang>/exercises/practice/<exercise>" or bare "<exercise>" (see
     # parse_fromfile_entries above) -- strip to the bare exercise name since
-    # that's what PER_TEST_TSV's "exercise" column holds either way.
+    # that's what PER_TEST_TSV's "exercise" column holds either way. When the
+    # keyword carries a language it must match PER_TEST_TSV's "language" column
+    # too: exercise names collide across languages (bowling, paasio, ...).
     already_passed() {
-      local ex="${1##*/}"
+      local ex="${1##*/}" lang=""
+      [[ "$1" == */exercises/practice/* ]] && lang="${1%%/*}"
       [[ -f "$PER_TEST_TSV" ]] || return 1
-      awk -F'\t' -v alias="$MODEL" -v ex="$ex" '
-        NR==1 { for (i=1;i<=NF;i++) { if ($i=="srv.--alias") a=i; if ($i=="exercise") e=i; if ($i=="pass") p=i }; next }
-        $a==alias && $e==ex && $p=="true" { found=1 }
+      awk -F'\t' -v alias="$MODEL" -v ex="$ex" -v lang="$lang" -v effort="$REASONING_EFFORT" '
+        NR==1 { for (i=1;i<=NF;i++) { if ($i=="srv.--alias") a=i; if ($i=="exercise") e=i; if ($i=="pass") p=i; if ($i=="language") l=i; if ($i=="reasoning_effort") r=i }; next }
+        $a==alias && $e==ex && (lang=="" || $l==lang) && $r==effort && $p=="true" { found=1 }
+        END { exit !found }
+      ' "$PER_TEST_TSV"
+    }
+
+    # recorded_at_seed <exercise-keyword> <any|pass>: true if $MODEL has a REAL
+    # recorded attempt for this exercise at the current $SEED -- "any" = pass
+    # or fail, "pass" = passed only. Stall bail-outs (bailed_on_max_duration=
+    # true) don't count: those are the server dying/hanging, not the model
+    # failing, so they deserve a rerun. Rows from before seeds were recorded
+    # (blank seed column) never match.
+    recorded_at_seed() {
+      local ex="${1##*/}" lang=""
+      [[ "$1" == */exercises/practice/* ]] && lang="${1%%/*}"
+      [[ -f "$PER_TEST_TSV" ]] || return 1
+      awk -F'\t' -v alias="$MODEL" -v ex="$ex" -v lang="$lang" -v seed="$SEED" -v want="$2" -v effort="$REASONING_EFFORT" '
+        NR==1 { for (i=1;i<=NF;i++) { if ($i=="srv.--alias") a=i; if ($i=="exercise") e=i; if ($i=="seed") s=i; if ($i=="pass") p=i; if ($i=="language") l=i; if ($i=="bailed_on_max_duration") b=i; if ($i=="reasoning_effort") r=i }; next }
+        $a==alias && $e==ex && (lang=="" || $l==lang) && $r==effort && $s==seed && $b!="true" && (want=="any" || $p=="true") { found=1 }
         END { exit !found }
       ' "$PER_TEST_TSV"
     }
 
     ORIG_TRIES="$TRIES"
     ORIG_MAX_DUR="$AIDER_BENCHMARK_MAX_DUR"
-    for (( SEED_ATTEMPT=1; SEED_ATTEMPT<=SEED_TRIES; SEED_ATTEMPT++ )); do
-      SEED=$(( BASE_SEED + SEED_ATTEMPT - 1 ))
-      SAMPLING_SLUG="temp${TEMPERATURE}-seed${SEED}"
+    SEED_IDX=0
+    for SEED in "${SEED_LIST[@]}"; do
+      SEED_IDX=$(( SEED_IDX + 1 ))
+      SAMPLING_SLUG="temp${TEMPERATURE}-seed${SEED}${EFFORT_SLUG}"
       RUN_NAME="fromfile-$(basename "$FROMFILE_PATH" | sed 's/\.[^.]*$//')-${MODEL_SLUG}-${SAMPLING_SLUG}"
-      guard_reuse "results/$RUN_NAME" "${@:3}"
-      write_model_settings
 
-      # This attempt's entries: seed 1 respects SKIP_EXISTING (opt-in, since
-      # a plain first run normally wants everything attempted); every seed
-      # after that ALWAYS filters to just what's still not passing -- that's
-      # the entire point of retrying with a new seed, no separate flag needed.
+      # Filter BEFORE guard_reuse/write_model_settings: a seed with nothing to
+      # run must not touch (or, under --clean, archive) its existing run dir.
+      SEED_GATED=0
+      if [[ "$SEED" != "$SEED_MIN" && "$SEED_ALWAYS_ALL" -eq 0 && -z "${SEED_ALWAYS_SET[$SEED]:-}" ]]; then
+        SEED_GATED=1
+      fi
       CUR_ENTRIES=()
+      N_PASSED=0
+      N_SEED_PASSED=0
+      N_TRIED=0
       for entry in "${FROMFILE_ENTRIES[@]}"; do
         kw="${entry%%$'\t'*}"
-        if [[ "$SEED_ATTEMPT" -gt 1 || "$SKIP_EXISTING" == "1" ]] && already_passed "$kw"; then
+        if [[ "$SEED_GATED" -eq 1 || "$SKIP_PASS" -eq 1 ]] && already_passed "$kw"; then
+          N_PASSED=$(( N_PASSED + 1 ))
+          continue
+        fi
+        if [[ "$SKIP_SEED_PASS" -eq 1 ]] && recorded_at_seed "$kw" pass; then
+          N_SEED_PASSED=$(( N_SEED_PASSED + 1 ))
+          continue
+        fi
+        if [[ "$SKIP_SEED_TRIED" -eq 1 ]] && recorded_at_seed "$kw" any; then
+          N_TRIED=$(( N_TRIED + 1 ))
           continue
         fi
         CUR_ENTRIES+=("$entry")
       done
+      echo "-- seed $SEED ($SEED_IDX/${#SEED_LIST[@]}, gated=$SEED_GATED): skipping $N_PASSED passed-at-any-seed, $N_SEED_PASSED passed-at-this-seed, $N_TRIED attempted-at-this-seed (SKIP_EXISTING=$SKIP_EXISTING)" >&2
       if [[ "${#CUR_ENTRIES[@]}" -eq 0 ]]; then
-        echo "-- seed $SEED: nothing left to attempt (all exercises already passed) -- stopping seed loop" >&2
-        break
+        echo "-- seed $SEED: nothing to attempt" >&2
+        continue
       fi
-      if [[ "$SEED_ATTEMPT" -gt 1 ]]; then
-        echo "-- seed $SEED (attempt $SEED_ATTEMPT/$SEED_TRIES): retrying ${#CUR_ENTRIES[@]} still-failing exercise(s)" >&2
+      if [[ "$SEED_GATED" -eq 1 ]]; then
+        echo "-- seed $SEED ($SEED_IDX/${#SEED_LIST[@]}): retrying ${#CUR_ENTRIES[@]} not-yet-passed exercise(s)" >&2
+      else
+        echo "-- seed $SEED ($SEED_IDX/${#SEED_LIST[@]}): attempting ${#CUR_ENTRIES[@]} exercise(s)" >&2
       fi
+      guard_reuse "results/$RUN_NAME" "${@:3}"
+      write_model_settings
 
       declare -A FROMFILE_GROUP_KEYWORDS=()
       FROMFILE_GROUP_ORDER=()
@@ -1384,14 +1715,14 @@ case "$CMD" in
       # skipped/missing exercises against a healthy one.
       health_ok=0
       for _ in 1 2; do
-        if curl -sf --max-time 10 "${LLAMA_HEALTH_URL:-http://localhost:8080/health}" 2>/dev/null | grep -q '"status":"ok"'; then
+        if curl -sf --max-time 10 "$LLAMA_HEALTH_URL" 2>/dev/null | grep -Eq '"status": *"ok"'; then
           health_ok=1
           break
         fi
         sleep 5
       done
       if [[ "$health_ok" -eq 0 ]]; then
-        echo "WARNING: llama-cpp server not responding at ${LLAMA_HEALTH_URL:-http://localhost:8080/health} -- skipping this group instead of waiting out its stall timeout (caller should reload the server and retry missing exercises)" >&2
+        echo "WARNING: llama-cpp server not responding at $LLAMA_HEALTH_URL -- skipping this group instead of waiting out its stall timeout (caller should reload the server and retry missing exercises)" >&2
         continue
       fi
       # `if !` (not a bare statement) so a non-zero exit here -- benchmark.py
@@ -1473,13 +1804,20 @@ case "$CMD" in
     echo "                            with a table of where this model diverged from that baseline."
     echo "                            Results go to results/fromfile-<basename>/; --clean/--resume"
     echo "                            work the same as full/python. See results/shortlist-15.txt."
-    echo "                            SKIP_EXISTING=1 drops exercises this alias already passed"
-    echo "                            (any prior run/seed) before attempting anything."
-    echo "                            SEED_TRIES=N (default 1) retries whatever's still not"
-    echo "                            passing with the next seed, up to N seeds, stopping early"
-    echo "                            once nothing's left -- also doubles as crash recovery:"
-    echo "                            re-run the same command after a dead server killed some"
-    echo "                            groups and it'll skip what passed, redo what didn't."
+    echo "                            SKIP_EXISTING=<scopes> (comma list) picks what finished work is"
+    echo "                            skipped: pass (passed at ANY seed), seed-pass (passed at THIS"
+    echo "                            seed), seed (attempted, pass or fail, at THIS seed), resume ="
+    echo "                            pass,seed (same as SKIP_EXISTING=1), none/0 (default)."
+    echo "                            SEED=N SEED_TRIES=K runs seeds N..N+K-1; SEEDS=\"2\"|\"1 3\"|\"1-3\""
+    echo "                            names them explicitly (wins over both). Every seed but the"
+    echo "                            lowest is gated: it only runs exercises not yet passed at any"
+    echo "                            seed. SEED_ALWAYS=\"2\"|\"2 3\"|all lifts that gate for those seeds."
+    echo "                            e.g. fill every missing seed-2 record:"
+    echo "                              SEEDS=2 SEED_ALWAYS=2 SKIP_EXISTING=seed"
+    echo "                            fill seed 2 only where nothing ever passed:"
+    echo "                              SEEDS=2 SKIP_EXISTING=pass,seed"
+    echo "                            Also doubles as crash recovery: re-run the same command and"
+    echo "                            it skips what's done, redoes what isn't."
     echo "  stats <run-dir>           Regenerate stats from completed run"
     echo "  shell                     Interactive shell in benchmark container"
     echo "  custom [exercise ...] args  Pass arbitrary benchmark.py args"
@@ -1512,7 +1850,7 @@ case "$CMD" in
     echo "                                        applies to smoke/quick/python/polyglot/full/custom"
     echo "                                        (the diff command always forces diff)"
     echo "  TRIES=<n>                             (default: 6) fix-up attempts per exercise"
-    echo "  MAX_TOKENS=<n>                        (default: 16000) hard cap, thinking+answer"
+    echo "  MAX_TOKENS=<n>                        (default: 16000 at low, from REASONING_EFFORT) hard cap, thinking+answer"
     echo "  DECODE_TPS=<n>                         (default: 25) for timeout auto-calc"
     echo "  PREFILL_BUFFER=<seconds>              (default: 120) prompt-eval headroom"
     echo "  REQUEST_TIMEOUT=<seconds>             (default: auto from MAX_TOKENS/DECODE_TPS)"
@@ -1521,16 +1859,29 @@ case "$CMD" in
     echo "                                        skips remaining tries once exceeded, so a"
     echo "                                        model stuck re-tripping the same error"
     echo "                                        doesn't burn e.g. 90 minutes on one exercise"
-    echo "  MAX_DUR_SCALE=<factor>                (default: 1) multiplies MAX_DUR and every"
+    echo "  MAX_DUR_SCALE=<factor>|auto           (default: 1) multiplies MAX_DUR and every"
     echo "                                        per-exercise fromfile override by this factor --"
     echo "                                        e.g. MAX_DUR_SCALE=2.5 for a model known to run"
     echo "                                        2-3x slower per-token than this project's usual"
-    echo "                                        comparison set, instead of hand-editing every line"
-    echo "  REASONING_EFFORT=low|medium|high|\"\"  (default: low, best-effort only)"
-    echo "  TEMPERATURE=<float>                   (default: 0.6) sent per request; 0 = greedy"
+    echo "                                        comparison set, instead of hand-editing every line."
+    echo "                                        auto = max(1, AUTO_SCALE_BASE_TPS(100) / the live"
+    echo "                                        server's measured decode tok/s), probed once per run"
+    echo "  REASONING_EFFORT=low|medium|xhigh|\"\" (default: low; high = xhigh) a bundle -- sent to the chat"
+    echo "                                        template AND scales the rest (first-guess numbers):"
+    echo "                                          low    thinking 4096   MAX_TOKENS 16000  max_dur x1"
+    echo "                                          medium thinking 8192   MAX_TOKENS 20000  max_dur x1.5"
+    echo "                                          xhigh  thinking 16384  MAX_TOKENS 32000  max_dur x2.5"
+    echo "                                        REQUEST_TIMEOUT follows MAX_TOKENS. Non-low runs get their own"
+    echo "                                        results dir (-xhigh suffix); skip checks only match same effort."
+    echo "  REASONING_BUDGET=<n>                  override the thinking-token cap, sent per request (no server"
+    echo "                                        restart; recorded in srv.--reasoning-budget). Empty = don't send."
+    echo "  EFFORT_DUR_MULT=<x>                   override the effort's max_dur multiplier (stacks with MAX_DUR_SCALE)"
+    echo "  TEMPERATURE=<float>|server            (default: 0.6; server for TARGET=strata) sent per request;"
+    echo "                                        0 = greedy; server = send none, the server's own sampling defaults apply"
+    echo "  TARGET=llama-nas|strata               (default: llama-nas) which server to eval; NAS_HOST / STRATA_URL override addresses"
     echo "  SEED=<int>                            (default: 1) same seed+settings reproduces a"
     echo "                                        run; change it for another independent sample"
-    echo "  SKIP_EXISTING=1 / SEED_TRIES=<int>    fromfile-only; see 'fromfile' above"
+    echo "  SKIP_EXISTING / SEED_TRIES / SEEDS / SEED_ALWAYS    fromfile-only; see 'fromfile' above"
     echo "  LLAMA_BASE_URL=http://host:port/v1    (default: tailscale :3002)"
     echo "  LLAMA_CONTAINER=<name>                (default: auto-detect running llama-server)"
     echo "  TRACK_TSV=<path>                      (default: ./results/eval-results.tsv)"

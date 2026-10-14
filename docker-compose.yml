@@ -7,6 +7,10 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ./results:/results
+      # "full-" variants of exercises whose helper files the stock harness hides
+      # from the model (see extra-exercises/README.md); read-only, copied per run
+      - ./extra-exercises/java/exercises/practice/full-word-search:/benchmarks/polyglot-benchmark/java/exercises/practice/full-word-search:ro
+      - ./extra-exercises/go/exercises/practice/full-paasio:/benchmarks/polyglot-benchmark/go/exercises/practice/full-paasio:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
