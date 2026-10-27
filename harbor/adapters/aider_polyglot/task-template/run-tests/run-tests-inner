@@ -1,0 +1,66 @@
+#!/bin/bash
+# (fork, test-calls tasks) Runs as `tester` via sudo from /usr/local/bin/run-tests.
+# Copies /app into a scratch dir and runs the verifier's own test script
+# (test-local.sh: tests/test.sh with /app and /logs/verifier redirected) against
+# it, so the agent's workspace is untouched and the result matches what final
+# grading would say for the same code. Appends one line per call to
+# /var/lib/run-tests/log.tsv: n, timestamp, exit code, passed, total.
+set -uo pipefail
+export HOME=/home/tester
+# sudo resets the environment to its secure_path, which lacks the image's
+# toolchain dirs (/usr/local/go/bin, /usr/local/cargo/bin, JAVA_HOME, ...);
+# env.sh is the image's own ENV, snapshotted at build time
+source /opt/run-tests/env.sh
+# the agent may pipe us into `head`/`tail -n`: without this a closed pipe kills
+# the script with SIGPIPE before the call is logged (a free, uncounted run)
+trap '' PIPE
+
+LIMIT=$(cat /opt/run-tests/limit)
+STATE=/var/lib/run-tests
+LOG=$STATE/log.tsv
+n=$(( $(wc -l 2>/dev/null < "$LOG" || echo 0) + 1 ))
+if [ "$n" -gt "$LIMIT" ]; then
+    echo "No test runs left (all $LIMIT used)."
+    exit 3
+fi
+
+WORK=$(mktemp -d /tmp/run-tests.XXXXXX)
+OUT=$(mktemp -d /tmp/run-tests-out.XXXXXX)
+trap 'rm -rf "$WORK" "$OUT"' EXIT
+cp -a /app/. "$WORK/"
+
+echo "Test run $n of $LIMIT..."
+WORK="$WORK" OUT="$OUT" TEST_DIR=/opt/hidden-tests bash /opt/hidden-tests/test-local.sh > "$OUT/full.log" 2>&1
+# reward.json is one line from count_tests.sh; no python in every image, so grep it
+j=$(cat "$OUT/reward.json" 2>/dev/null || true)
+field() { printf '%s' "$j" | grep -o "\"$1\": *[0-9]*" | grep -o '[0-9]*$' || echo 0; }
+passed=$(field tests_passed); total=$(field tests_total)
+rc=$([ "$(field reward)" = 1 ] && echo 0 || echo 1)
+# count the call before printing anything
+printf '%d\t%s\t%d\t%d\t%d\n' "$n" "$(date -u +%FT%TZ)" "$rc" "$passed" "$total" >> "$LOG"
+[ "$n" -ge "$LIMIT" ] && touch "$STATE/limit_reached"
+
+# Show the test runner's own output (not the setup noise), bounded like aider's
+# patched benchmark does, so a runaway test can't flood the agent's context.
+out="$OUT/test-output.txt"
+lines=$(wc -l < "$out" 2>/dev/null || echo 0)
+if [ ! -s "$out" ]; then
+    # the test script died before running any tests (setup/build step): show why
+    echo "[test harness failed before running the tests; last lines of its log:]"
+    tail -40 "$OUT/full.log" 2>/dev/null
+elif [ "$lines" -gt 250 ]; then
+    head -50 "$out"; echo "... [$((lines - 200)) lines omitted] ..."; tail -150 "$out"
+else
+    cat "$out" 2>/dev/null
+fi
+echo
+if [ "$rc" -eq 0 ]; then
+    echo "Test run $n of $LIMIT: all $total tests passed."
+else
+    if [ "$total" -eq 0 ]; then
+        echo "Test run $n of $LIMIT: FAILED (the tests did not build/run -- see errors above). Runs left: $((LIMIT - n))."
+    else
+        echo "Test run $n of $LIMIT: FAILED ($passed of $total tests passed). Runs left: $((LIMIT - n))."
+    fi
+fi
+exit "$rc"

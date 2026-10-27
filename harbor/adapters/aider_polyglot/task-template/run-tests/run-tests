@@ -1,0 +1,24 @@
+#!/bin/bash
+# (fork, test-calls tasks) The agent's only way to run the hidden tests:
+# /usr/local/bin/run-tests, run as the non-root `agent` user. The tests live in
+# /opt/hidden-tests (tester-only, mode 700); run-tests-inner runs them as
+# `tester` against a scratch copy of /app and logs the call.
+#
+# After the last allowed call this ends the agent's session: every `agent`
+# process is killed a few seconds after the output is printed. Installed agents
+# (Claude Code) then exit non-zero and Harbor grades the workspace;
+# terminus-2's harbor_ext wrapper sees the limit_reached marker and does the same.
+
+# ignore SIGPIPE (e.g. `run-tests | head`) so the limit check below still runs
+trap '' PIPE
+sudo -n -u tester /opt/run-tests/run-tests-inner
+rc=$?
+
+limit=$(cat /opt/run-tests/limit)
+used=$(wc -l 2>/dev/null < /var/lib/run-tests/log.tsv || echo 0)
+if [ "$used" -ge "$limit" ]; then
+    echo
+    echo "That was your last test run ($used of $limit). Your session now ends and your code is graded as it is."
+    setsid nohup bash -c 'sleep 5; pkill -KILL -u agent' >/dev/null 2>&1 < /dev/null &
+fi
+exit $rc

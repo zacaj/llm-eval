@@ -11,8 +11,9 @@ services:
       # from the model (see extra-exercises/README.md); read-only, copied per run
       - ./extra-exercises/java/exercises/practice/full-word-search:/benchmarks/polyglot-benchmark/java/exercises/practice/full-word-search:ro
       - ./extra-exercises/go/exercises/practice/full-paasio:/benchmarks/polyglot-benchmark/go/exercises/practice/full-paasio:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    network_mode: host
     environment:
       - OPENAI_API_KEY=sk-dummy
       - OPENAI_API_BASE=${LLAMA_BASE_URL:-http://100.71.29.121:3002/v1}
@@ -24,6 +25,12 @@ services:
       # https://openrouter.ai/api/v1 on its own, ignoring OPENAI_API_BASE above.
       # Empty/unset is harmless for local-server runs that never reference it.
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+    # Exercise tests run model-written code; a runaway one (e.g. forth) once ate
+    # ~94GB and hard-locked the host via zram thrash. Cap it so the OOM kill
+    # happens inside the container. memswap == mem means no swap.
+    mem_limit: 16g
+    memswap_limit: 16g
+    pids_limit: 2048
     working_dir: /aider
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     tty: true

@@ -229,9 +229,39 @@ if ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
   echo "ERROR: SEED='$SEED' is not a non-negative integer." >&2
   exit 1
 fi
+# EXTRA_BODY: a JSON object merged into every request body (aider's
+# extra_params.extra_body), for toying with sampler knobs the server accepts
+# but run.sh has no dedicated variable for, e.g.
+#   EXTRA_BODY='{"top_k":20,"min_p":0.1,"top_p":0.9}'
+# Fields the server doesn't know are typically ignored, so check the server's
+# captured settings (srv.* columns) if a knob seems to do nothing. It is part
+# of the results-dir/settings-file name (a short hash, so runs with different
+# bodies never share a dir or satisfy each other's skip checks) and is recorded
+# verbatim in the extra_body column of the TSVs.
+EXTRA_BODY="${EXTRA_BODY:-}"
+EXTRA_SLUG=""
+if [[ -n "$EXTRA_BODY" ]]; then
+  if ! EXTRA_BODY=$(python3 -I -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except ValueError as e:
+    sys.exit("invalid JSON (%s)" % e)
+if not isinstance(d, dict) or not d:
+    sys.exit("must be a non-empty JSON object")
+bad = {"reasoning_budget_tokens", "provider", "reasoning"} & d.keys()
+if bad:
+    sys.exit("%s already set by run.sh (REASONING_BUDGET / OR_PROVIDER / OR_REASONING_TOKENS)" % sorted(bad))
+print(json.dumps(d, sort_keys=True, separators=(",", ":")))
+' "$EXTRA_BODY" 2>&1); then
+    echo "ERROR: EXTRA_BODY is not usable: $EXTRA_BODY" >&2
+    exit 1
+  fi
+  EXTRA_SLUG="-x$(printf '%s' "$EXTRA_BODY" | sha1sum | cut -c1-6)"
+fi
 # Part of every per-run file path (model-settings YAML, fromfile's results
 # dir) so runs of the same model at different seeds never share a dir.
-SAMPLING_SLUG="temp${TEMPERATURE}-seed${SEED}${EFFORT_SLUG}"
+SAMPLING_SLUG="temp${TEMPERATURE}-seed${SEED}${EFFORT_SLUG}${EXTRA_SLUG}"
 DECODE_TPS="${DECODE_TPS:-25}"              # assumed tok/s, for timeout auto-calc -- kept conservative
                                              # since it needs to cover the slowest configs tested (partial
                                              # CPU-offload "-fit on" models can run ~25-30 tok/s), not just
@@ -269,7 +299,7 @@ MAX_DUR="${MAX_DUR:-480}"
 # default 100 -- never below 1x, so a fast model keeps the stock limits. It
 # only corrects for decode speed, not for how many tokens a model chooses to
 # generate; the MAX_DUR values themselves already carry that fuzz. If the
-# probe fails it warns and falls back to 1.
+# probe fails the run aborts (rather than silently using 1x).
 MAX_DUR_SCALE="${MAX_DUR_SCALE:-1}"
 AUTO_SCALE_BASE_TPS="${AUTO_SCALE_BASE_TPS:-100}"
 scale_max_dur() {
@@ -278,43 +308,15 @@ scale_max_dur() {
   awk -v d="$1" -v s="$s" -v m="$EFFORT_DUR_MULT" 'BEGIN { printf "%.0f", d * s * m }'
 }
 
-# Decode tok/s of the live server: two 200-token completions (the first pays
-# one-time warmup), reading llama-server's own timings.predicted_per_second
-# from the response -- unlike scraping docker logs this works for spec-decode
-# builds too. Prints nothing if the server can't answer.
-measure_decode_tps() {
-  # Strata has no /completion; its /metrics already holds decode speed from
-  # real requests (totals since start, else the live mean), so no probe load.
-  if [[ "$TARGET" == "strata" ]]; then
-    curl -sf --max-time 10 "$LLAMA_SERVER_URL/metrics" 2>/dev/null | python3 -c '
-import sys, json
-d = json.load(sys.stdin)
-t = d.get("totals", {})
-if t.get("decode_ms") and t.get("output_tokens"):
-    print(t["output_tokens"] / (t["decode_ms"] / 1000))
-elif d.get("live", {}).get("tok_s_mean"):
-    print(d["live"]["tok_s_mean"])
-' 2>/dev/null
-    return 0
-  fi
-  local url="$LLAMA_HEALTH_URL" i out tps=""
-  url="${url%/health}/completion"
-  for i in 1 2; do
-    out="$(curl -sf --max-time 180 "$url" -H 'Content-Type: application/json' \
-      -d '{"prompt":"Write a short paragraph about the history of bridges.","n_predict":200,"temperature":0.6}' 2>/dev/null \
-      | python3 -c 'import sys,json; print(json.load(sys.stdin)["timings"]["predicted_per_second"])' 2>/dev/null)" || out=""
-    [[ -n "$out" ]] && tps="$out"
-  done
-  echo "$tps"
-}
+# measure_decode_tps: in server-capture.sh (shared with harbor/harbor.sh)
 
 resolve_auto_max_dur_scale() {
   [[ "$MAX_DUR_SCALE" == "auto" ]] || return 0
   local tps
   tps="$(measure_decode_tps)"
   if [[ -z "$tps" ]] || ! awk -v t="$tps" 'BEGIN { exit !(t > 0) }'; then
-    echo "WARNING: MAX_DUR_SCALE=auto couldn't measure decode speed (server not answering?) -- using 1x" >&2
-    MAX_DUR_SCALE=1
+    echo "ERROR: MAX_DUR_SCALE=auto couldn't measure decode speed (see probe errors above). Aborting rather than silently running with 1x limits; set MAX_DUR_SCALE=<number> to override." >&2
+    exit 1
   else
     MAX_DUR_SCALE="$(awk -v t="$tps" -v b="$AUTO_SCALE_BASE_TPS" 'BEGIN { s = b / t; if (s < 1) s = 1; printf "%.2f", s }')"
     echo "-- MAX_DUR_SCALE=auto: decode ${tps} tok/s vs ${AUTO_SCALE_BASE_TPS} baseline -> ${MAX_DUR_SCALE}x (min 1x)" >&2
@@ -377,116 +379,9 @@ TRACK_TSV="${TRACK_TSV:-$(pwd)/results/eval-results.tsv}"
 # zipper better than model B") are a plain filter on one file instead of
 # needing to dig through individual .aider.chat.history.md transcripts.
 PER_TEST_TSV="${PER_TEST_TSV:-$(pwd)/results/eval-results-per-test.tsv}"
-LLAMA_CONTAINER="${LLAMA_CONTAINER:-}"
-
-detect_llama_container() {
-  if [[ -n "$LLAMA_CONTAINER" ]]; then
-    echo "$LLAMA_CONTAINER"
-    return
-  fi
-  local pattern found
-  for pattern in "llama-cpp-turboquant-llama-cpp-1" "llama-server" "llama-cpp" "llama"; do
-    found="$("${LLAMA_DOCKER[@]}" ps --filter "name=$pattern" --filter "status=running" --format '{{.Names}}' | head -1)"
-    if [[ -n "$found" ]]; then
-      echo "$found"
-      return
-    fi
-  done
-}
-
-# llama-server flags that are purely about *how fast*/*where* inference runs
-# (threading, GPU offload split, batching, networking, logging, caching infra,
-# speculative-decoding draft config) rather than *how the model behaves*
-# (sampling params, context/RoPE handling, KV-cache quant, chat templating).
-# Blacklisted so perf-tuning noise doesn't pollute behavior comparisons.
-SRV_BLACKLIST="--server --host --port -lv --log-timestamps --log-colors --verbosity \
---threads --threads-batch -t -tb --n-gpu-layers -ngl --n-cpu-moe --tensor-split -ts \
---main-gpu -mg --split-mode -sm --batch-size -b --ubatch-size -ub --parallel -np \
---cont-batching -cb --no-cont-batching --mlock --no-mmap --numa --flash-attn -fa \
---fit --fit-ctx --cache-prompt --checkpoint-every-n-tokens --slot-save-path \
---ctx-checkpoints --metrics --api-key --ssl-key-file --ssl-cert-file --timeout \
---no-webui --draft-max --draft-min --draft-p-min --gpu-layers-draft --model-draft \
---jinja --checkpoint-min-step --cache-ram --cache-idle-slots --kv-unified \
---spec-draft-ngl --spec-draft-n-cpu-moe \
---device --device-draft --spec-draft-type-k --spec-draft-type-v --defrag-thold"
-
-
-
-# Strata has no container to `docker inspect`, so its settings come from three
-# endpoints: /props (model identity), /metrics .engine (KV-cache type etc.) and
-# /config (the run config's sampling defaults). Keys reuse llama's flag names
-# where they mean the same thing so rows stay comparable/filterable. Only
-# behavior-affecting engine fields are kept (perf-only ones -- expert cache,
-# arena, workers, PCIe, VRAM -- are dropped, same as SRV_BLACKLIST does for
-# llama). Sampling: an absent config value means the server falls back to the
-# engine default, which is greedy (serve/server.py), so that is recorded as
-# --temp=0 rather than left blank. Best-effort: every fetch is a silent no-op
-# if the server doesn't answer.
-capture_strata_settings() {
-  local props metrics cfg
-  props="$(curl -sf --max-time 10 "$LLAMA_SERVER_URL/props" 2>/dev/null)" || props="{}"
-  metrics="$(curl -sf --max-time 10 "$LLAMA_SERVER_URL/metrics" 2>/dev/null)" || metrics="{}"
-  cfg="$(curl -sf --max-time 10 "$LLAMA_SERVER_URL/config" 2>/dev/null)" || cfg="{}"
-  python3 -c '
-import json, sys
-def load(s):
-    try: return json.loads(s)
-    except Exception: return {}
-props, metrics, cfg = (load(a) for a in sys.argv[1:4])
-out = {}
-path = props.get("model_path", "")
-if path: out["srv.-m"] = path.replace("\\", "/").rsplit("/", 1)[-1]
-if props.get("model_alias"): out["srv.--alias"] = props["model_alias"]
-if props.get("build_info"): out["srv.build_info"] = props["build_info"]
-eng = metrics.get("engine", {})
-for src, dst in (("context", "srv.--ctx-size"), ("kv", "srv.kv_cache"),
-                 ("logit_bias", "srv.logit_bias"), ("spec_min_p", "srv.spec_min_p")):
-    if eng.get(src) is not None: out[dst] = eng[src]
-vals = {k["key"]: k.get("value") for k in cfg.get("keys", [])}
-for src, dst in (("sampling.temperature", "srv.--temp"), ("sampling.top_p", "srv.--top-p"),
-                 ("sampling.top_k", "srv.--top-k"), ("sampling.min_p", "srv.--min-p")):
-    if vals.get(src) is not None: out[dst] = vals[src]
-if "srv.--temp" not in out and cfg: out["srv.--temp"] = 0   # engine default is greedy
-for k, v in out.items(): print(f"{k}={v}")
-' "$props" "$metrics" "$cfg" 2>/dev/null || true
-}
-
-# Extract non-blacklisted llama-server CLI args as key=value lines
-# (prefixed srv.<flag>=<value>). Best-effort: silent no-op if no server
-# container is running.
-capture_srv_settings() {
-  local container="$1" inspect_json
-  [[ -z "$container" ]] && return
-  inspect_json="$("${LLAMA_DOCKER[@]}" inspect "$container" 2>/dev/null)" || return
-  [[ -z "$inspect_json" ]] && return
-  echo "$inspect_json" | python3 -c "
-import json, sys, re
-
-blacklist = set('''$SRV_BLACKLIST'''.split())
-data = json.load(sys.stdin)
-args = data[0].get('Args', [])
-
-def is_flag(s):
-    return s.startswith('-') and not re.match(r'^-\d', s)
-
-i = 0
-while i < len(args):
-    arg = args[i]
-    if is_flag(arg):
-        key = arg
-        val = ''
-        if i + 1 < len(args) and not is_flag(args[i + 1]):
-            val = args[i + 1]
-            i += 1
-        if not val:
-            val = 'yes'
-        if key not in blacklist:
-            print(f'srv.{key}={val}')
-        i += 1
-    else:
-        i += 1
-"
-}
+# Server settings capture (detect_llama_container, capture_srv_settings,
+# strata_settings_effective, ...): shared with harbor/harbor.sh
+source "$(dirname "${BASH_SOURCE[0]}")/server-capture.sh"
 
 # Shared dynamic-header TSV writer, embedded in both track_per_test and
 # track_aggregate below (each is its own `python3 -c`, a fresh interpreter,
@@ -653,7 +548,7 @@ print(max_mtime)
 " "$PER_TEST_TSV" "$run_dir" "$cmd_name" "$AIDER_MODEL" "$srv_file" "$since_ts" \
       "edit_format=$edit_format" "tries=$TRIES" "max_tokens=$MAX_TOKENS" \
       "reasoning_effort=$REASONING_EFFORT" "request_timeout=$REQUEST_TIMEOUT" \
-      "target=$TARGET" "temperature=$TEMPERATURE" "seed=$SEED" "or_provider=$OR_PROVIDER" "or_reasoning_tokens=$OR_REASONING_TOKENS"
+      "target=$TARGET" "temperature=$TEMPERATURE" "seed=$SEED" "or_provider=$OR_PROVIDER" "or_reasoning_tokens=$OR_REASONING_TOKENS" "extra_body=$EXTRA_BODY"
 }
 
 # Aggregate summary row over the FULL run range [since_ts, now] into
@@ -823,7 +718,7 @@ print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model} seed={row[\"seed\"]}: 
 " "$TRACK_TSV" "$run_dir" "$cmd_name" "$AIDER_MODEL" "$srv_file" "$since_ts" \
       "edit_format=$edit_format" "tries=$TRIES" "max_tokens=$MAX_TOKENS" \
       "reasoning_effort=$REASONING_EFFORT" "request_timeout=$REQUEST_TIMEOUT" \
-      "target=$TARGET" "temperature=$TEMPERATURE" "seed=$SEED" "or_provider=$OR_PROVIDER" "or_reasoning_tokens=$OR_REASONING_TOKENS"
+      "target=$TARGET" "temperature=$TEMPERATURE" "seed=$SEED" "or_provider=$OR_PROVIDER" "or_reasoning_tokens=$OR_REASONING_TOKENS" "extra_body=$EXTRA_BODY"
 }
 
 # Runs benchmark.py in the background, polling every POLL_INTERVAL seconds
@@ -838,6 +733,20 @@ print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model} seed={row[\"seed\"]}: 
 # Returns benchmark.py's real exit status (propagated via `return`, not
 # swallowed) so callers/set -e still see a real failure as a failure.
 POLL_INTERVAL="${POLL_INTERVAL:-15}"
+
+# Regenerates results/eval-viz.html from PER_TEST_TSV; called whenever new per-test
+# rows land. Best-effort: a viz failure must never fail or stall the benchmark run.
+# VIZ_REFRESH=0 disables it.
+VIZ_REFRESH="${VIZ_REFRESH:-1}"
+refresh_viz() {
+  [[ "$VIZ_REFRESH" == "0" ]] && return 0
+  local dir
+  dir="$(dirname "$PER_TEST_TSV")"
+  [[ -f "$dir/generate_viz_data.py" ]] || return 0
+  (cd "$dir" && python3 generate_viz_data.py >/dev/null 2>&1) \
+    || echo "WARNING: viz refresh failed (run generate_viz_data.py in $dir to see why)" >&2
+  return 0
+}
 _CURRENT_DOCKER_PID=""
 _CURRENT_SRV_FILE=""
 _on_benchmark_interrupt() {
@@ -873,7 +782,7 @@ run_benchmark_and_track() {
   # srv_file empty rather than record its unrelated alias/flags as srv.* columns.
   if [[ "$MODEL" != */* ]]; then
     if [[ "$TARGET" == "strata" ]]; then
-      capture_strata_settings > "$srv_file"
+      strata_settings_effective > "$srv_file"
     else
       container="$(detect_llama_container)"
       capture_srv_settings "$container" > "$srv_file"
@@ -912,6 +821,7 @@ run_benchmark_and_track() {
     TRACK_WATERMARK="$(track_per_test "$cmd_name" "$run_dir" "$edit_format" "$TRACK_WATERMARK" "$srv_file")"
     if [[ "$TRACK_WATERMARK" != "$prev_watermark" ]]; then
       last_progress_ts=$(date +%s)
+      refresh_viz
     elif (( $(date +%s) - last_progress_ts > stall_ceiling )); then
       echo "" >&2
       echo "WARNING: no exercise progress for ${stall_ceiling}s -- assuming this group is stuck" >&2
@@ -930,6 +840,7 @@ run_benchmark_and_track() {
   # Catch anything that finished between the last poll and process exit.
   TRACK_WATERMARK="$(track_per_test "$cmd_name" "$run_dir" "$edit_format" "$TRACK_WATERMARK" "$srv_file")"
   track_aggregate "$cmd_name" "$run_dir" "$edit_format" "$RUN_START_TS" "$srv_file"
+  refresh_viz
 
   rm -f "$srv_file"
   _CURRENT_SRV_FILE=""
@@ -1067,8 +978,16 @@ EOF
     [[ "$TEMPERATURE" != "server" ]] && echo "    temperature: $TEMPERATURE"
     echo "    seed: $SEED"
   } >> "$f"
-  if [[ -n "$OR_PROVIDER" || -n "$OR_REASONING_TOKENS" || -n "$(local_reasoning_budget)" ]]; then
+  if [[ -n "$EXTRA_BODY" || -n "$OR_PROVIDER" || -n "$OR_REASONING_TOKENS" || -n "$(local_reasoning_budget)" ]]; then
     echo "    extra_body:" >> "$f"
+    if [[ -n "$EXTRA_BODY" ]]; then
+      # JSON scalars/arrays/objects are valid YAML flow values, so dump as-is.
+      python3 -I -c '
+import json, sys
+for k, v in json.loads(sys.argv[1]).items():
+    print("      %s: %s" % (json.dumps(k), json.dumps(v)))
+' "$EXTRA_BODY" >> "$f"
+    fi
     if [[ -n "$(local_reasoning_budget)" ]]; then
       echo "      reasoning_budget_tokens: $(local_reasoning_budget)" >> "$f"
     fi
@@ -1346,7 +1265,7 @@ run_python_subset() {
     "/results/$name" \
     --model "$AIDER_MODEL" \
     --edit-format "$fmt" \
-    --threads 1 \
+    --threads "${THREADS:-1}" \
     --tries "$TRIES" \
     --languages python \
     --num-tests "$num_tests" \
@@ -1404,7 +1323,7 @@ case "$CMD" in
       /results/random \
       --model "$AIDER_MODEL" \
       --edit-format "$EDIT_FORMAT" \
-      --threads 1 \
+      --threads "${THREADS:-1}" \
       --tries "$TRIES" \
       --languages python \
       --num-tests "$RANDOM_N" \
@@ -1427,7 +1346,7 @@ case "$CMD" in
       /results/python \
       --model "$AIDER_MODEL" \
       --edit-format "$EDIT_FORMAT" \
-      --threads 1 \
+      --threads "${THREADS:-1}" \
       --tries "$TRIES" \
       --languages python \
       --exercises-dir /benchmarks/polyglot-benchmark \
@@ -1458,7 +1377,7 @@ case "$CMD" in
       /results/polyglot \
       --model "$AIDER_MODEL" \
       --edit-format "$EDIT_FORMAT" \
-      --threads 1 \
+      --threads "${THREADS:-1}" \
       --tries "$TRIES" \
       --num-tests "$POLY_NUM_TESTS" \
       --exercises-dir /benchmarks/polyglot-benchmark \
@@ -1479,7 +1398,7 @@ case "$CMD" in
       /results/full \
       --model "$AIDER_MODEL" \
       --edit-format "$EDIT_FORMAT" \
-      --threads 1 \
+      --threads "${THREADS:-1}" \
       --tries "$TRIES" \
       --exercises-dir /benchmarks/polyglot-benchmark \
       --new \
@@ -1595,9 +1514,55 @@ case "$CMD" in
       fi
     done
 
+    # Sampler identity. Rows are matched on the sampler settings actually in
+    # effect, not on the TEMPERATURE label: TEMPERATURE=server sends nothing, so
+    # the temperature really used is whatever the server was running (srv.--temp),
+    # and top-p/top-k/min-p always come from the server. Without this, rows from
+    # a 0.6 server and a 1.0 server both read "server" and wrongly count as the
+    # same experiment. Resolved once here from the live server; a row's effective
+    # temp is its temperature column, or srv.--temp when that says "server".
+    CUR_SRV_TEMP="" CUR_TOP_P="" CUR_TOP_K="" CUR_MIN_P="" SAMPLER_KNOWN=0
+    if [[ "$MODEL" != */* ]]; then
+      _srv_settings=""
+      if [[ "$TARGET" == "strata" ]]; then
+        _srv_settings="$(strata_settings_effective)"
+      else
+        _srv_settings="$(capture_srv_settings "$(detect_llama_container)")"
+      fi
+      _srv_get() { sed -n "s/^$1=//p" <<< "$_srv_settings" | head -1; }
+      CUR_SRV_TEMP="$(_srv_get srv.--temp)"
+      CUR_TOP_P="$(_srv_get srv.--top-p)"
+      CUR_TOP_K="$(_srv_get srv.--top-k)"
+      CUR_MIN_P="$(_srv_get srv.--min-p)"
+      [[ -n "$_srv_settings" ]] && SAMPLER_KNOWN=1
+    fi
+    if [[ "$TEMPERATURE" == "server" ]]; then
+      if [[ -z "$CUR_SRV_TEMP" ]]; then
+        echo "ERROR: TEMPERATURE=server but the server's temperature could not be read, so existing results can't be matched against it. Is the server up? (Set TEMPERATURE=<float> to bypass.)" >&2
+        exit 1
+      fi
+      CUR_EFF_TEMP="$CUR_SRV_TEMP"
+    else
+      CUR_EFF_TEMP="$TEMPERATURE"
+    fi
+    echo "-- sampler in effect: temp=$CUR_EFF_TEMP (TEMPERATURE=$TEMPERATURE) top-p=${CUR_TOP_P:-?} top-k=${CUR_TOP_K:-?} min-p=${CUR_MIN_P:-?}" >&2
+
+    # awk fragment shared by the history lookups below: sets `same` to whether
+    # the row's effective sampler equals the current one. Top-p/k/min-p are only
+    # compared when the live server could be read (SAMPLER_KNOWN).
+    SAMPLER_AWK='
+      function norm(x) { return (x == "") ? "" : x + 0 }
+      function same_sampler(   et) {
+        et = ($t == "server") ? $st : $t
+        if (et == "" || norm(et) != norm(ctemp)) return 0
+        if (known && (norm($tp) != norm(ctp) || norm($tk) != norm(ctk) || norm($mp) != norm(cmp))) return 0
+        return 1
+      }'
+    SAMPLER_AWK_HDR='if ($i=="srv.--temp") st=i; if ($i=="srv.--top-p") tp=i; if ($i=="srv.--top-k") tk=i; if ($i=="srv.--min-p") mp=i;'
+
     # already_passed <exercise-keyword>: true if $MODEL has EVER recorded a
-    # pass for this exercise at the current $REASONING_EFFORT in PER_TEST_TSV
-    # (an xhigh pass is a different result from a low one), any run_cmd/seed. Keyword is
+    # pass for this exercise at the current $REASONING_EFFORT and $TEMPERATURE in PER_TEST_TSV
+    # (an xhigh pass is a different result from a low one; same for temperature), any run_cmd/seed. Keyword is
     # "<lang>/exercises/practice/<exercise>" or bare "<exercise>" (see
     # parse_fromfile_entries above) -- strip to the bare exercise name since
     # that's what PER_TEST_TSV's "exercise" column holds either way. When the
@@ -1607,9 +1572,10 @@ case "$CMD" in
       local ex="${1##*/}" lang=""
       [[ "$1" == */exercises/practice/* ]] && lang="${1%%/*}"
       [[ -f "$PER_TEST_TSV" ]] || return 1
-      awk -F'\t' -v alias="$MODEL" -v ex="$ex" -v lang="$lang" -v effort="$REASONING_EFFORT" '
-        NR==1 { for (i=1;i<=NF;i++) { if ($i=="srv.--alias") a=i; if ($i=="exercise") e=i; if ($i=="pass") p=i; if ($i=="language") l=i; if ($i=="reasoning_effort") r=i }; next }
-        $a==alias && $e==ex && (lang=="" || $l==lang) && $r==effort && $p=="true" { found=1 }
+      awk -F'\t' -v alias="$MODEL" -v ex="$ex" -v lang="$lang" -v effort="$REASONING_EFFORT" \
+        -v ctemp="$CUR_EFF_TEMP" -v ctp="$CUR_TOP_P" -v ctk="$CUR_TOP_K" -v cmp="$CUR_MIN_P" -v known="$SAMPLER_KNOWN" "$SAMPLER_AWK"'
+        NR==1 { for (i=1;i<=NF;i++) { if ($i=="srv.--alias") a=i; if ($i=="exercise") e=i; if ($i=="pass") p=i; if ($i=="language") l=i; if ($i=="reasoning_effort") r=i; if ($i=="temperature") t=i; '"$SAMPLER_AWK_HDR"' }; next }
+        $a==alias && $e==ex && (lang=="" || $l==lang) && $r==effort && same_sampler() && $p=="true" { found=1 }
         END { exit !found }
       ' "$PER_TEST_TSV"
     }
@@ -1624,9 +1590,10 @@ case "$CMD" in
       local ex="${1##*/}" lang=""
       [[ "$1" == */exercises/practice/* ]] && lang="${1%%/*}"
       [[ -f "$PER_TEST_TSV" ]] || return 1
-      awk -F'\t' -v alias="$MODEL" -v ex="$ex" -v lang="$lang" -v seed="$SEED" -v want="$2" -v effort="$REASONING_EFFORT" '
-        NR==1 { for (i=1;i<=NF;i++) { if ($i=="srv.--alias") a=i; if ($i=="exercise") e=i; if ($i=="seed") s=i; if ($i=="pass") p=i; if ($i=="language") l=i; if ($i=="bailed_on_max_duration") b=i; if ($i=="reasoning_effort") r=i }; next }
-        $a==alias && $e==ex && (lang=="" || $l==lang) && $r==effort && $s==seed && $b!="true" && (want=="any" || $p=="true") { found=1 }
+      awk -F'\t' -v alias="$MODEL" -v ex="$ex" -v lang="$lang" -v seed="$SEED" -v want="$2" -v effort="$REASONING_EFFORT" \
+        -v ctemp="$CUR_EFF_TEMP" -v ctp="$CUR_TOP_P" -v ctk="$CUR_TOP_K" -v cmp="$CUR_MIN_P" -v known="$SAMPLER_KNOWN" "$SAMPLER_AWK"'
+        NR==1 { for (i=1;i<=NF;i++) { if ($i=="srv.--alias") a=i; if ($i=="exercise") e=i; if ($i=="seed") s=i; if ($i=="pass") p=i; if ($i=="language") l=i; if ($i=="bailed_on_max_duration") b=i; if ($i=="reasoning_effort") r=i; if ($i=="temperature") t=i; '"$SAMPLER_AWK_HDR"' }; next }
+        $a==alias && $e==ex && (lang=="" || $l==lang) && $r==effort && same_sampler() && $s==seed && $b!="true" && (want=="any" || $p=="true") { found=1 }
         END { exit !found }
       ' "$PER_TEST_TSV"
     }
@@ -1636,7 +1603,7 @@ case "$CMD" in
     SEED_IDX=0
     for SEED in "${SEED_LIST[@]}"; do
       SEED_IDX=$(( SEED_IDX + 1 ))
-      SAMPLING_SLUG="temp${TEMPERATURE}-seed${SEED}${EFFORT_SLUG}"
+      SAMPLING_SLUG="temp${TEMPERATURE}-seed${SEED}${EFFORT_SLUG}${EXTRA_SLUG}"
       RUN_NAME="fromfile-$(basename "$FROMFILE_PATH" | sed 's/\.[^.]*$//')-${MODEL_SLUG}-${SAMPLING_SLUG}"
 
       # Filter BEFORE guard_reuse/write_model_settings: a seed with nothing to
@@ -1735,7 +1702,7 @@ case "$CMD" in
         "/results/$RUN_NAME" \
         --model "$AIDER_MODEL" \
         --edit-format "$EDIT_FORMAT" \
-        --threads 1 \
+        --threads "${THREADS:-1}" \
         --tries "$TRIES" \
         --exercises-dir /benchmarks/polyglot-benchmark \
         --new \
@@ -1875,9 +1842,12 @@ case "$CMD" in
     echo "                                        results dir (-xhigh suffix); skip checks only match same effort."
     echo "  REASONING_BUDGET=<n>                  override the thinking-token cap, sent per request (no server"
     echo "                                        restart; recorded in srv.--reasoning-budget). Empty = don't send."
+    echo "  VIZ_REFRESH=0                         don't regenerate results/eval-viz.html after each new result"
     echo "  EFFORT_DUR_MULT=<x>                   override the effort's max_dur multiplier (stacks with MAX_DUR_SCALE)"
     echo "  TEMPERATURE=<float>|server            (default: 0.6; server for TARGET=strata) sent per request;"
     echo "                                        0 = greedy; server = send none, the server's own sampling defaults apply"
+    echo "  EXTRA_BODY='{\"top_k\":20,\"min_p\":0.1}'   JSON merged into every request body (any sampler knob the server"
+    echo "                                        accepts); gets its own results dir (-x<hash>) and an extra_body TSV column"
     echo "  TARGET=llama-nas|strata               (default: llama-nas) which server to eval; NAS_HOST / STRATA_URL override addresses"
     echo "  SEED=<int>                            (default: 1) same seed+settings reproduces a"
     echo "                                        run; change it for another independent sample"
