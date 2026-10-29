@@ -3,9 +3,13 @@
 # print a Harbor reward.json object on stdout:
 #   {"reward": 0|1, "tests_passed": P, "tests_total": T, "tests_frac": P/T, "tests_parsed": 0|1}
 # reward is the binary exit-code result (unchanged from upstream semantics);
-# tests_parsed=0 means no runner summary was found (usually a compile/collect
-# failure), in which case P=T=0 and the true total must come from elsewhere
-# (e.g. an oracle run of the same task).
+# tests_parsed=0 means no test results were found (usually a compile/collect
+# failure).
+# T is never below the task's known total (expected_total next to this script,
+# from an oracle run, written at gen time): a test that never ran -- crash, abort,
+# timeout, build failure -- counts as failed. Passes are counted per test line
+# where the runner prints them, so a run that died partway still reports the
+# tests that passed before it did.
 #
 # Plain bash+awk on purpose: the task images don't all ship python.
 #
@@ -21,11 +25,18 @@ parsed=0
 
 case "$lang" in
 python)
-    # pytest's final "==== 2 failed, 11 passed in 0.12s ====" line
+    # pytest's final "==== 2 failed, 11 passed in 0.12s ====" line; without it
+    # (killed by the timeout) the -v per-test lines and "collected N items"
     read -r passed total parsed < <(awk '
         /^=+ .* in [0-9.]+s/ { line = $0 }
+        / collected [0-9]+ item/ { for (i = 1; i <= NF; i++) if ($i == "collected") c = $(i+1) }
+        /::[^ ]+ PASSED/ { vp++ }
+        /::[^ ]+ (FAILED|ERROR)/ { vf++ }
         END {
-            if (line == "") { print 0, 0, 0; exit }
+            if (line == "") {
+                t = vp + vf; if (c > t) t = c
+                print vp + 0, t + 0, (t > 0 ? 1 : 0); exit
+            }
             p = f = e = 0
             n = split(line, w, /[ ,]+/)
             for (i = 2; i <= n; i++) {
@@ -58,16 +69,17 @@ go)
         }' "$log")
     ;;
 rust)
-    # one "test result: ok. 12 passed; 0 failed; 0 ignored; ..." per test binary
+    # per-test "test name ... ok|FAILED" lines and each binary's "running N tests",
+    # not the "test result:" summary: a stack overflow aborts the whole binary
+    # before its summary, which dropped every test in it from the count
     read -r passed total parsed < <(awk '
-        /^test result: / {
-            found = 1
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /^passed;?$/) p += $(i-1)
-                else if ($i ~ /^failed;?$/) f += $(i-1)
-            }
-        }
-        END { print p + 0, p + f, found + 0 }' "$log")
+        /^running [0-9]+ tests?$/ { announced += $2 }
+        /^test .* \.\.\. ok$/ { p++ }
+        /^test .* \.\.\. FAILED$/ { f++ }
+        END {
+            t = p + f; if (announced > t) t = announced
+            print p + 0, t + 0, (t > 0 ? 1 : 0)
+        }' "$log")
     ;;
 javascript)
     # jest: "Tests:       2 failed, 11 passed, 13 total"
@@ -114,10 +126,16 @@ java)
     ;;
 esac
 
+# known total for this task (oracle run, written at gen time); missing = unknown
+expected=$(cat "$(dirname "$0")/expected_total" 2>/dev/null || echo 0)
+[[ "$expected" =~ ^[0-9]+$ ]] || expected=0
+[ "$expected" -gt "$total" ] && total=$expected
+
 reward=$([ "$exit_code" -eq 0 ] && echo 1 || echo 0)
 frac=$(awk -v p="$passed" -v t="$total" 'BEGIN { printf "%.4f", (t > 0 ? p / t : 0) }')
 # (fork) test-calls tasks: the agent's run-tests history (one line per call:
-# n, timestamp, exit code, passed, total -- written by /opt/run-tests/run-tests-inner)
+# n, end timestamp, exit code, passed, total, start timestamp -- written by
+# /opt/run-tests/run-tests-inner; test.sh also copies it to run-tests-log.tsv)
 calls_json=""
 if [ -f /opt/run-tests/limit ]; then
     limit=$(cat /opt/run-tests/limit)
@@ -128,5 +146,5 @@ if [ -f /opt/run-tests/limit ]; then
     calls_json=$(printf ', "test_limit": %d, "test_calls": %d, "test_limit_hit": %d, "first_pass_call": %d' \
         "$limit" "$calls" "$([ "$calls" -ge "$limit" ] && echo 1 || echo 0)" "$first_pass")
 fi
-printf '{"reward": %d, "tests_passed": %d, "tests_total": %d, "tests_frac": %s, "tests_parsed": %d%s}\n' \
-    "$reward" "$passed" "$total" "$frac" "$parsed" "$calls_json"
+printf '{"reward": %d, "tests_passed": %d, "tests_total": %d, "tests_frac": %s, "tests_parsed": %d, "tests_expected": %d%s}\n' \
+    "$reward" "$passed" "$total" "$frac" "$parsed" "$expected" "$calls_json"

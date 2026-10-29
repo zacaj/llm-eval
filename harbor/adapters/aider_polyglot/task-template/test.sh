@@ -98,12 +98,26 @@ fi
 
 echo "Running tests for {exercise_name} ({language})"
 EXERCISE_NAME="{exercise_name}"
-# (fork) run in a subshell and tee the output so count_tests.sh can parse it
-set +e
-(
+# (fork) run in its own script under a wall-clock cap and tee the output so
+# count_tests.sh can parse it. Without the cap, a solution that loops forever hangs
+# the verifier until Harbor's 30-min verifier timeout (no reward at all) and hangs
+# the agent's run-tests calls, which use this same script. aider's harness caps a
+# test run at 180s; this is a bit looser because builds here start cold. `timeout`
+# signals the script's whole process group, so test-runner children die too.
+TEST_TIMEOUT="${{TEST_TIMEOUT:-300}}"
+tests_script=$(mktemp /tmp/polyglot-tests.XXXXXX)
+cat > "$tests_script" <<'__POLYGLOT_TESTS__'
 {test_command_with_test_dir}
-) 2>&1 | tee /logs/verifier/test-output.txt
+__POLYGLOT_TESTS__
+export TEST_DIR EXERCISE_NAME
+set +e
+timeout -k 10 "$TEST_TIMEOUT" bash "$tests_script" 2>&1 | tee /logs/verifier/test-output.txt
 exit_code=${{PIPESTATUS[0]}}
+if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
+    echo "TESTS TIMED OUT: the test run was stopped after ${{TEST_TIMEOUT}}s (an infinite loop or a very slow solution?)" \
+      | tee -a /logs/verifier/test-output.txt
+fi
+rm -f "$tests_script"
 set -e
 
 echo "=== TEST EXECUTION COMPLETED ==="
@@ -132,6 +146,11 @@ bash "$TEST_DIR/count_tests.sh" "{language}" /logs/verifier/test-output.txt "$ex
   && mv /logs/verifier/reward.json.tmp /logs/verifier/reward.json \
   || rm -f /logs/verifier/reward.json.tmp
 cat /logs/verifier/reward.json 2>/dev/null || true
+# (fork) test-calls tasks: keep the per-call history (reward.json only summarizes it,
+# and /var/lib/run-tests dies with the container) -> collect.py harbor-progress.tsv
+if [ -f /var/lib/run-tests/log.tsv ]; then
+  cp /var/lib/run-tests/log.tsv /logs/verifier/run-tests-log.tsv || true
+fi
 
 if [ -f /logs/verifier/test-console-output.txt ]; then
   chmod 664 /logs/verifier/test-console-output.txt || true

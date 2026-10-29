@@ -1,0 +1,20 @@
+# One reliably-easy exercise per language: a plumbing check for Harbor
+# agents/servers (does every language's image build, agent install, model
+# connection, verifier and collector work), not a capability measure.
+# Picked from results/eval-results-per-test.tsv (aider harness, mixed models):
+# highest pass rate with a decent run count; java has no >90% exercise there.
+#
+#   ./harbor/harbor.sh run claude-code --list harbor/lists/smoke-per-language.txt
+#   ./harbor/harbor.sh run oracle      --list harbor/lists/smoke-per-language.txt -n 6
+#
+# 3rd column = test calls for test-calls tasks (harbor.sh gen-tc --list; run.sh reads
+# it as max_tries): aider passed_at_try p95 + 1 -- slightly permissive, since one
+# aider try ~= one round of test feedback.
+#
+# language     exercise            calls  # aider pass rate (runs), passed_at_try counts
+python         paasio              5      # 0.99 (84)   1:8 2:47 3:19 4:8 5:1
+go             simple-linked-list  5      # 0.95 (136)  1:43 2:49 3:22 4:15
+javascript     triangle            3      # 0.94 (35)   1:29 2:4
+rust           simple-cipher       4      # 0.93 (27)   1:12 2:9 3:4
+cpp            sublist             5      # 0.91 (22)   2:11 3:7 4:2
+java           satellite           9      # 0.88 (24)   3:1 4:8 5:5 6:4 7:1 8:1 10:1

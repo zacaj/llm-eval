@@ -48,10 +48,8 @@ set -euo pipefail
 #              task default) for slower models, as in run.sh: a number (default 1) or
 #              auto = max(1, AUTO_SCALE_BASE_TPS(100) / the server's measured decode tok/s).
 #              Job names / max_dur column / SKIP_EXISTING use the scaled limit.
-#   BUDGET     per-trial output-token budget enforced by the prompt-logger proxy's eval
-#              mode (default 0 = unlimited). Model requests always carry X-Eval-Budget,
-#              which also keeps them off the proxy's routes (one model per eval) -- see
-#              the "Eval mode" section of the proxy's docstring.
+#   BUDGET     per-trial output-token budget (default 0 = unlimited), enforced by
+#              eval_proxy.py (see EVAL_PROXY_HOST below)
 #   SERVER_URL model server itself, not the proxy (default http://$NAS_HOST:8080); its
 #              sampling/quality settings are saved to jobs/<job>/server-settings.txt
 #              (same capture as run.sh's srv.* columns, via ../server-capture.sh)
@@ -59,6 +57,19 @@ set -euo pipefail
 #              what's missing, counting matching earlier trials from any job (same
 #              agent+version/BUDGET/time limit (or finished within it)/server sampling+model; INVALID and ungraded
 #              infra errors don't count) -- rerun the same command to resume
+#   EFFORT     Claude Code effort level (CLAUDE_CODE_EFFORT_LEVEL; default low, matching
+#              run.sh's REASONING_EFFORT default -- Claude Code's own default is high,
+#              which Strata resolves to xhigh). What the server actually resolved is
+#              recorded as srv.eff.reasoning_effort / srv.eff.reasoning_budget.
+#              Also sets the thinking cap (eval_proxy.py --think-budget): low 6000,
+#              medium 12000, high/xhigh 24000; max_tokens = cap + ANSWER_TOKENS.
+#   THINK_BUDGET   override the thinking cap (0 = leave the request as Claude Code sent it)
+#   ANSWER_TOKENS  answer/tool-call headroom added to the cap for max_tokens (default 8000)
+#   DISALLOWED_TOOLS  Claude Code tools removed for evals (--disallowedTools; default
+#              Agent,WebFetch,WebSearch). Agent: subagents swap the prompt back and forth,
+#              which throws away the server's prompt cache every time on a parallel=1
+#              llama (-> timeouts); web tools let the model fetch the exercise's real
+#              tests from GitHub. Recorded in run-settings.txt; set "" to allow all.
 #   CC_VERSION Claude Code version to run (default: the one pre-installed in the task
 #              images, ARG CC_VERSION in adapters/aider_polyglot/task-template/Dockerfile;
 #              a different value makes Harbor install it per trial)
@@ -72,6 +83,14 @@ cd "$(dirname "$0")"
 
 HARBOR=(uvx harbor@0.25.0)
 BASE_URL="${BASE_URL:-http://192.168.2.15:3002}"
+# Agents talk to eval_proxy.py (one per job, on this host) which forwards to BASE_URL:
+# per-trial token budget + per-request log of what the server says it did
+# (jobs/<job>/eval-proxy.tsv). EVAL_PROXY_HOST = this host's address as the trial
+# containers see it (default: our source IP toward BASE_URL's host).
+base_host=$(printf '%s' "$BASE_URL" | sed -E 's|^[a-z]+://([^/:]+).*|\1|')
+EVAL_PROXY_HOST="${EVAL_PROXY_HOST:-$(ip route get "$base_host" 2>/dev/null | grep -o 'src [0-9.]*' | cut -d' ' -f2)}"
+EVAL_PROXY_PORT="${EVAL_PROXY_PORT:-$(python3 -c 'import socket; s = socket.socket(); s.bind(("", 0)); print(s.getsockname()[1])')}"
+EVAL_URL="http://$EVAL_PROXY_HOST:$EVAL_PROXY_PORT"
 # TC: unset = per list row (a row with a try count -> its __tc<count> test-calls task,
 # otherwise the classic task; non-list runs are classic); 1 = test-calls for everything;
 # 0 = classic for everything. An explicit DATASET overrides all of it.
@@ -85,10 +104,24 @@ fi
 BUDGET="${BUDGET:-0}"
 MAX_DUR="${MAX_DUR:-}"
 MAX_DUR_SCALE="${MAX_DUR_SCALE:-1}"
+EFFORT="${EFFORT:-low}"
+case "$EFFORT" in
+  low)          _THINK_BUDGET=8000 ;;
+  medium)       _THINK_BUDGET=16000 ;;
+  high|xhigh)   _THINK_BUDGET=32000 ;;
+  *) echo "ERROR: EFFORT='$EFFORT' is not one of low|medium|xhigh (high = xhigh)." >&2; exit 1 ;;
+esac
+THINK_BUDGET="${THINK_BUDGET:-$_THINK_BUDGET}"
+ANSWER_TOKENS="${ANSWER_TOKENS:-8000}"
+DISALLOWED_TOOLS="${DISALLOWED_TOOLS-Agent,WebFetch,WebSearch}"
+# PARALLEL_TOOLS=1 (default): appends a system-prompt line asking Claude Code to batch independent
+# tool calls into one turn (fewer model round trips per trial). 0 = Claude Code's stock prompt.
+PARALLEL_TOOLS="${PARALLEL_TOOLS:-1}"
+PARALLEL_TOOLS_PROMPT="When several tool calls are independent of each other (reading multiple files, running searches, checking several things at once), issue them together in a single turn rather than one per turn. Only sequence calls when a later one needs an earlier one's result."
 AUTO_SCALE_BASE_TPS="${AUTO_SCALE_BASE_TPS:-100}"
 PROXY_FILTERS="${PROXY_FILTERS:-1}"
 NAS_HOST="${NAS_HOST:-192.168.2.15}"
-SERVER_URL="${SERVER_URL:-http://$NAS_HOST:8080}"
+SERVER_URL="${SERVER_URL:-http://$NAS_HOST:3002}"
 
 LANGS=" python go rust javascript java cpp "
 
@@ -160,6 +193,13 @@ capture_server() (
         # the probe has to send a seed; harbor requests never do (Strata picks one per request)
         strata_settings_effective | grep -v '^srv\.eff\.seed_from='
         echo "srv.eff.seed_from=server"
+        # thinking settings as a Claude Code request resolves them: through the proxy
+        # (filters apply) with the effort harbor.sh passes
+        if [ "${agent:-}" = claude-code ]; then
+            probe_strata_reasoning "$BASE_URL" \
+                "{\"output_config\": {\"effort\": \"$EFFORT\"}, \"thinking\": {\"type\": \"adaptive\"}}" \
+                "X-Eval-Budget: 1000" $([ "$PROXY_FILTERS" = 0 ] && echo "X-Eval-Filters:0")
+        fi
     else
         echo "srv.target=llama"
         capture_srv_settings "$(detect_llama_container)"
@@ -200,6 +240,103 @@ run)
     done
     [ ${#groups[@]} -gt 0 ] || groups["$DATASET|-"]=""
 
+    # Known test totals (expected-totals.tsv -> tasks' tests/expected_total) let the
+    # verifier count tests that never ran as failed. For any selected exercise without
+    # one, first run the oracle on its classic task (no model needed, so before any
+    # SWAP_CMD), let collect.py record the total, and regenerate the selected tasks of
+    # that exercise. An exercise whose oracle doesn't pass stays unknown (warned, and
+    # retried next run). EXPECTED_PREFILL=0 skips this (nop: only with EXPECTED_PREFILL=1).
+    if [ "${EXPECTED_PREFILL:-1}" = 1 ] && [ "$agent" != oracle ] \
+        && { [ "$agent" != nop ] || [ "${EXPECTED_PREFILL:-}" = 1 ]; }; then
+        pre_globs=()
+        for ((i = 0; i < ${#passthru[@]}; i++)); do
+            case "${passthru[$i]}" in -i|--include) pre_globs+=("${passthru[$((i + 1))]}") ;; esac
+        done
+        need=()   # "<dataset>/<task>" whose exercise has no known total
+        for key in "${!groups[@]}"; do
+            ds="${key%%|*}"
+            g=(); while IFS= read -r x; do [ -n "$x" ] && g+=("$x"); done <<<"${groups[$key]}"
+            g+=("${pre_globs[@]}"); [ ${#g[@]} -gt 0 ] || g=("*")
+            while IFS= read -r t; do
+                [[ "$t" =~ ^polyglot_([a-z]+)_(.+)$ ]] || continue
+                lang="${BASH_REMATCH[1]}"; ex="${BASH_REMATCH[2]%__tc*}"
+                awk -F'\t' -v l="$lang" -v e="$ex" '$1 == l && $2 == e { f = 1 } END { exit !f }' \
+                    expected-totals.tsv 2>/dev/null || need+=("$ds/$t")
+            done < <(cd "$ds" && for x in "${g[@]}"; do compgen -G "$x" || true; done | sort -u)
+        done
+        if [ ${#need[@]} -gt 0 ]; then
+            exs=$(printf '%s\n' "${need[@]}" | sed -E 's#.*/polyglot_([a-z]+)_(.+)$#\1_\2#; s/__tc[0-9]+$//' | sort -u)
+            echo "EXPECTED_PREFILL: no known test total for $(echo $exs | wc -w) exercise(s); running the oracle first: $(echo $exs)" >&2
+            oi=(); for e in $exs; do oi+=(-i "polyglot_$e"); done
+            ( unset SWAP_CMD; CHECK="auto: expected test totals (EXPECTED_PREFILL)" TC=0 DATASET="" \
+                SKIP_EXISTING=0 MAX_DUR="" MAX_DUR_SCALE=1 "$PWD/harbor.sh" run oracle "${oi[@]}" ) \
+                || echo "EXPECTED_PREFILL: oracle run failed; continuing without totals" >&2
+            # that run's collect.py updated expected-totals.tsv; regenerate what we're about to run
+            ORACLE_SECRET=$(openssl rand -hex 16) python3 adapters/aider_polyglot/main.py \
+                --task-ids "$(echo $exs | tr ' ' ',')" >/dev/null
+            for p in "${need[@]}"; do
+                [[ "$p" =~ /polyglot_([a-z]+)_(.+)__tc([0-9]+)$ ]] || continue
+                ORACLE_SECRET=$(openssl rand -hex 16) python3 adapters/aider_polyglot/main.py \
+                    --output-dir "$TC_DATASET" --task-ids "${BASH_REMATCH[1]}_${BASH_REMATCH[2]}" \
+                    --test-calls "${BASH_REMATCH[3]}" >/dev/null
+            done
+            for e in $exs; do
+                awk -F'\t' -v k="$e" '$1 "_" $2 == k { f = 1 } END { exit !f }' expected-totals.tsv \
+                    || echo "EXPECTED_PREFILL: WARNING: oracle didn't pass for $e; its test total stays unknown" >&2
+            done
+        fi
+    fi
+
+    base_timeout=$(task_agent_timeout)
+    [ "$agent" = claude-code ] && CC_VERSION=${CC_VERSION:-$(sed -n 's/^ARG CC_VERSION=//p' adapters/aider_polyglot/task-template/Dockerfile 2>/dev/null)}
+    # SWAP_CMD='ssh ... llm strata foo': command that loads the model to evaluate. With
+    # SKIP_EXISTING=1 it only runs if some task still needs attempts. The server's settings
+    # (needed to match earlier trials) are unknown until it's loaded, so the pre-check uses
+    # the newest earlier job that recorded the same SWAP_CMD (jobs/*/swap-cmd.txt) and its
+    # server-settings / decode speed. No such job -> assume work is needed and swap. The
+    # real run re-checks against the live server, so a wrong guess only costs a swap.
+    if [ -n "${SWAP_CMD:-}" ] && ! [[ "$agent" =~ ^(oracle|nop)$ ]]; then
+        if [ "${SKIP_EXISTING:-0}" = 1 ]; then
+            prev=""
+            while IFS= read -r d; do   # newest first
+                [ -f "$d/swap-cmd.txt" ] && [ -f "$d/server-settings.txt" ] \
+                    && [ "$(cat "$d/swap-cmd.txt")" = "$SWAP_CMD" ] && { prev="$d"; break; }
+            done < <(ls -dt jobs/*/ 2>/dev/null | sed 's#/$##')
+            if [ -n "$prev" ]; then
+                pk=1; pglobs=()
+                for ((i = 0; i < ${#passthru[@]}; i++)); do
+                    case "${passthru[$i]}" in
+                    -k|--n-attempts) pk="${passthru[$((i + 1))]}" ;;
+                    -i|--include) pglobs+=("${passthru[$((i + 1))]}") ;;
+                    esac
+                done
+                pscale=1
+                if [ "$MAX_DUR_SCALE" = auto ]; then
+                    ptps=$(sed -n 's/^decode_tps=//p' "$prev/run-settings.txt" 2>/dev/null)
+                    pscale=$(awk -v t="${ptps:-0}" -v b="$AUTO_SCALE_BASE_TPS" 'BEGIN { s = (t > 0) ? b / t : 1; if (s < 1) s = 1; printf "%.2f", s }')
+                else pscale="$MAX_DUR_SCALE"; fi
+                todo=0
+                for key in "${!groups[@]}"; do
+                    pds="${key%%|*}"; pdur="${key#*|}"; [ "$pdur" = "-" ] && pdur="$MAX_DUR"
+                    if [ "$pscale" != 1 ]; then pdur=$(awk -v d="${pdur:-$base_timeout}" -v s="$pscale" 'BEGIN { printf "%.0f", d * s }'); fi
+                    pg=(); while IFS= read -r g; do [ -n "$g" ] && pg+=("$g"); done <<<"${groups[$key]}"
+                    pg+=("${pglobs[@]}"); [ ${#pg[@]} -gt 0 ] || pg=("*")
+                    while IFS=$'\t' read -r rem _; do todo=$((todo + rem)); done < <(
+                        python3 skip_existing.py --jobs jobs --dataset "$pds" --agent "$agent" ${CC_VERSION:+--agent-version "$CC_VERSION"} \
+                            --budget "$BUDGET" --think-budget "$THINK_BUDGET" --max-dur "$pdur" --k "$pk" --server "$prev/server-settings.txt" "${pg[@]}")
+                done
+                if [ "$todo" -eq 0 ]; then
+                    echo "SWAP_CMD: nothing left to run (per $prev); not swapping models" >&2
+                    exit 0
+                fi
+                echo "SWAP_CMD: $todo attempt(s) still needed; swapping" >&2
+            else
+                echo "SWAP_CMD: no earlier job recorded for this command; swapping" >&2
+            fi
+        fi
+        eval "$SWAP_CMD" || { echo "SWAP_CMD failed" >&2; exit 1; }
+    fi
+
     agent_spec="$agent"
     hdrs="X-Eval-Budget: $BUDGET"
     [ "$PROXY_FILTERS" = 0 ] && hdrs+=$'\nX-Eval-Filters: 0'
@@ -211,13 +348,18 @@ run)
     claude-code)
         model=$(model_id); label="$model"
         # Server ignores the Anthropic model name, but Harbor still wants provider/model.
-        export ANTHROPIC_BASE_URL="$BASE_URL" ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY_LOCAL:-local}"
+        export ANTHROPIC_BASE_URL="$EVAL_URL" ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY_LOCAL:-local}"
         # pinned agent version: matches the image's pre-installed build (task-template/Dockerfile
         # CC_VERSION) so Harbor skips its per-trial install; also part of SKIP_EXISTING's match
         CC_VERSION=${CC_VERSION:-$(sed -n 's/^ARG CC_VERSION=//p' adapters/aider_polyglot/task-template/Dockerfile 2>/dev/null)}
+        parallel_args=()
+        [ "$PARALLEL_TOOLS" = 1 ] && parallel_args=(--ak "append_system_prompt=$PARALLEL_TOOLS_PROMPT")
         agent_args=(-m "anthropic/$model" ${CC_VERSION:+--ak "version=$CC_VERSION"}
+            ${DISALLOWED_TOOLS:+--ak "disallowed_tools=$DISALLOWED_TOOLS"}
+            "${parallel_args[@]}"
             # no telemetry/autoupdate/background title calls hitting the model server
             --ae CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+            --ae "CLAUDE_CODE_EFFORT_LEVEL=$EFFORT"
             # newline-separated; proxy keys the budget on Claude Code's per-session metadata.user_id
             --ae "ANTHROPIC_CUSTOM_HEADERS=$hdrs")
         ;;
@@ -228,7 +370,7 @@ run)
         agent_spec="harbor_ext:BudgetedTerminus2"
         export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
         hdr_json=$(printf '%s' "$hdrs" | python3 -c 'import json,sys; print(json.dumps(dict(l.split(": ",1) for l in sys.stdin.read().splitlines())))')
-        agent_args=(-m "openai/$model" --ak "api_base=$BASE_URL/v1"
+        agent_args=(-m "openai/$model" --ak "api_base=$EVAL_URL/v1"
             # per-trial session uuid -> X-Eval-Session (the proxy's budget key)
             --ak 'session_id_headers=["X-Eval-Session"]'
             --ak "llm_call_kwargs={\"extra_headers\": $hdr_json}")
@@ -246,48 +388,99 @@ run)
         local suffix="$1"; shift
         local tasks i
         if [ $# -eq 0 ]; then   # no list: name it after any -i globs passed straight to harbor
-            for ((i = 0; i < ${#passthru[@]}; i++)); do
-                [[ "${passthru[$i]}" =~ ^(-i|--include)$ ]] && set -- "$@" "${passthru[$((i + 1))]}"
-            done
+            set -- "${cli_globs[@]}"
         fi
         if [ $# -eq 0 ]; then tasks="${list_name:-all}"
         elif [ $# -le 4 ]; then
             tasks=$(printf '%s\n' "$@" | sed -E 's/^polyglot_//; s/__tc([0-9]+)$/.tc\1/; s/\*/all/g; s/_/-/' | paste -sd+)
-        else tasks="${list_name:-tasks}.$#"; [ "$ds" = "$TC_DATASET" ] && tasks+=".tc"
+        else tasks="${list_name:-tasks}.$#"; printf '%s\n' "$@" | grep -q '__tc' && tasks+=".tc"
         fi
         printf '%s_%s%s_%s' "$run_id" "${tasks//[^A-Za-z0-9.+_-]/-}" "$suffix" "$tail_part"
     }
-    base_timeout=$(task_agent_timeout)
 
     srv_before=""
     [[ "$agent" =~ ^(oracle|nop)$ ]] || srv_before=$(capture_server 2>/dev/null || true)
+    # llama's /v1/models only reports its fixed --alias (e.g. Qwen3.6-35B-A3B) whatever
+    # GGUF is loaded, so name the model after the GGUF (-m) instead -- that's what Harbor
+    # records (UI, collect.py's model column). eval_proxy puts the alias back on the wire.
+    server_model="${model:-}"
+    gguf=$(printf '%s\n' "$srv_before" | sed -n 's/^srv\.-m=//p' | head -1)
+    if [ -z "${MODEL:-}" ] && [ -n "$gguf" ] && printf '%s\n' "$srv_before" | grep -q '^srv.target=llama'; then
+        model=$(basename "$gguf" .gguf | sed -E 's/-[0-9]{5}-of-[0-9]{5}$//')
+        agent_args[1]="${agent_args[1]%%/*}/$model"
+        label="$model"
+        echo "model: $model (llama alias $server_model)" >&2
+    fi
 
-    # SKIP_EXISTING=1: -k N means "make sure N graded attempts exist" (skip_existing.py
-    # has the matching rules); -i globs given directly are folded into the selection
+    # -i globs are resolved here (the job lists task paths, which Harbor's -i doesn't
+    # filter). SKIP_EXISTING=1: -k N means "make sure N graded attempts exist"
+    # (skip_existing.py has the matching rules); otherwise -k goes to Harbor as is.
     want_k=1; rest=(); cli_globs=()
+    i=0
+    while [ $i -lt ${#passthru[@]} ]; do
+        case "${passthru[$i]}" in
+        -k|--n-attempts) want_k="${passthru[$((i + 1))]}"
+            [ "${SKIP_EXISTING:-0}" = 1 ] || rest+=("${passthru[@]:$i:2}"); i=$((i + 2)) ;;
+        -i|--include) cli_globs+=("${passthru[$((i + 1))]}"); i=$((i + 2)) ;;
+        *) rest+=("${passthru[$i]}"); i=$((i + 1)) ;;
+        esac
+    done
+    passthru=("${rest[@]}")
     if [ "${SKIP_EXISTING:-0}" = 1 ]; then
         [ -n "$srv_before" ] || { echo "SKIP_EXISTING needs a model agent (server settings to match)" >&2; exit 1; }
-        i=0
-        while [ $i -lt ${#passthru[@]} ]; do
-            case "${passthru[$i]}" in
-            -k|--n-attempts) want_k="${passthru[$((i + 1))]}"; i=$((i + 2)) ;;
-            -i|--include) cli_globs+=("${passthru[$((i + 1))]}"); i=$((i + 2)) ;;
-            *) rest+=("${passthru[$i]}"); i=$((i + 1)) ;;
-            esac
-        done
-        passthru=("${rest[@]}")
         srv_file=$(mktemp); printf '%s\n' "$srv_before" > "$srv_file"
     fi
 
     # one Harbor job: dataset, job name, then extra harbor args
-    run_job() {
-        local ds="$1" job="$2"; shift 2
+    trap 'kill ${proxy_pid:-} ${watch_pid:-} ${progress_pid:-} 2>/dev/null || true' EXIT
+    run_job() {   # run_job <job name> <harbor args (task source, ...)>
+        local job="$1"; shift
         # run-level settings that aren't server settings -> collect.py columns
         mkdir -p "jobs/$job"
+        [ -z "${SWAP_CMD:-}" ] || printf '%s\n' "$SWAP_CMD" > "jobs/$job/swap-cmd.txt"
+        # CHECK=<reason>: a harness test, not a model result (collect.py -> harbor-trials-checks.tsv)
+        [ -z "${CHECK:-}" ] || printf '%s\n' "$CHECK" > "jobs/$job/CHECK"
         printf 'max_dur_scale=%s\nmax_dur_base=%s\ndecode_tps=%s\n' \
-            "$MAX_DUR_SCALE" "$base_dur" "${decode_tps_val:-}" > "jobs/$job/run-settings.txt"
-        "${HARBOR[@]}" run -y -p "$ds" -a "$agent_spec" "${agent_args[@]}" \
+            "$MAX_DUR_SCALE" "${base_dur:-}" "${decode_tps_val:-}" > "jobs/$job/run-settings.txt"
+        printf 'think_budget=%s\nanswer_tokens=%s\n' "$THINK_BUDGET" "$ANSWER_TOKENS" >> "jobs/$job/run-settings.txt"
+        [ "$agent" = claude-code ] && printf 'disallowed_tools=%s\nparallel_tools=%s\n' "$DISALLOWED_TOOLS" "$PARALLEL_TOOLS" >> "jobs/$job/run-settings.txt"
+        proxy_pid=""   # global: the EXIT trap below stops it if we're interrupted
+        if ! [[ "$agent" =~ ^(oracle|nop)$ ]]; then
+            python3 eval_proxy.py --port "$EVAL_PROXY_PORT" --upstream "$BASE_URL" \
+                ${server_model:+--model "$server_model"} \
+                --think-budget "$THINK_BUDGET" --answer-tokens "$ANSWER_TOKENS" \
+                --log "jobs/$job/eval-proxy.tsv" > "jobs/$job/eval-proxy.out" 2>&1 &
+            proxy_pid=$!
+            local i
+            for i in $(seq 50); do grep -q listening "jobs/$job/eval-proxy.out" 2>/dev/null && break; sleep 0.1; done
+            grep -q listening "jobs/$job/eval-proxy.out" || { echo "eval_proxy failed to start:" >&2; cat "jobs/$job/eval-proxy.out" >&2; kill $proxy_pid 2>/dev/null; rc=1; return; }
+        fi
+        # rebuild results/harbor-trials.tsv as each trial finishes: Harbor has no per-trial
+        # hook, but a trial's result.json only appears once it's done, so watch for those
+        # (set +e: this script's -e/pipefail would end the loop on the first empty glob)
+        (
+            set +eo pipefail
+            seen=0
+            while sleep 2; do
+                n=$(compgen -G "jobs/$job/*/result.json" | wc -l)
+                if [ "$n" != "$seen" ]; then seen=$n; python3 collect.py jobs >/dev/null 2>&1; fi
+            done
+        ) &
+        watch_pid=$!
+        # PROGRESS_INTERVAL=<secs> (default 180, 0 = off): grade each running trial's current
+        # /app in a side container every that many seconds -> <trial>/progress.tsv
+        # (progress_sampler.py; the agent sees nothing). PROGRESS_TIMEOUT caps each test run.
+        progress_pid=""
+        if [ "${PROGRESS_INTERVAL:-180}" != 0 ] && ! [[ "$agent" =~ ^(oracle|nop)$ ]]; then
+            python3 progress_sampler.py "jobs/$job" --interval "${PROGRESS_INTERVAL:-180}" \
+                --timeout "${PROGRESS_TIMEOUT:-90}" > "jobs/$job/progress-sampler.log" 2>&1 &
+            progress_pid=$!
+        fi
+        "${HARBOR[@]}" run -y -a "$agent_spec" "${agent_args[@]}" \
             -n 1 -o jobs --job-name "$job" "$@" "${passthru[@]}" || rc=$?
+        kill "$watch_pid" 2>/dev/null || true
+        [ -z "$progress_pid" ] || kill "$progress_pid" 2>/dev/null || true
+        [ -z "$proxy_pid" ] || kill "$proxy_pid" 2>/dev/null || true
         if [ -n "$srv_before" ] && [ -d "jobs/$job" ]; then
             printf '%s\n' "$srv_before" > "jobs/$job/server-settings.txt"
             srv_after=$(capture_server 2>/dev/null || true)
@@ -309,31 +502,46 @@ run)
         fi
     fi
 
+    # Every (dataset, time limit) group goes into ONE Harbor job. Harbor applies a single
+    # timeout multiplier per job, so a task whose limit differs from its task.toml runs
+    # from a copy with the limit written in: tasks/_dur/<secs>/<same task name> (same
+    # name, so collect.py / SKIP_EXISTING see the same task; both read the limit from
+    # the task.toml a trial actually ran). The job gets a generated config listing each
+    # task path once per attempt to run, so per-task attempt counts (SKIP_EXISTING) fit too.
     rc=0
+    task_paths=()   # one entry per trial to run
+    names=()        # distinct task names, for the job name
+    base_durs=()
+    variant() {     # variant <task dir> <secs> -> path of a copy whose agent timeout is <secs>
+        local src="$1" secs="$2" dst
+        if [ "$(awk '/^\[agent\]/{a=1;next} /^\[/{a=0} a && /^timeout_sec/{print int($3); exit}' "$src/task.toml")" = "$secs" ]; then
+            echo "$PWD/$src"; return
+        fi
+        dst="tasks/_dur/$secs/$(basename "$src")"
+        mkdir -p "$dst"
+        rsync -a --delete "$src/" "$dst/"
+        awk -v t="$secs" '/^\[/{a=($0=="[agent]")} a && /^timeout_sec/{$0="timeout_sec = " t ".0"} {print}' \
+            "$src/task.toml" > "$dst/task.toml"
+        echo "$PWD/$dst"
+    }
     for key in "${!groups[@]}"; do
         ds="${key%%|*}"; dur="${key#*|}"; [ "$dur" = "-" ] && dur="$MAX_DUR"
         # scale every limit (an unset one = the task default) for slower models
-        base_dur="${dur:-$base_timeout}"
+        base_dur="${dur:-$base_timeout}"; base_durs+=("$base_dur")
         if [ "$MAX_DUR_SCALE" != 1 ]; then
             dur=$(awk -v d="${dur:-$base_timeout}" -v s="$MAX_DUR_SCALE" 'BEGIN { printf "%.0f", d * s }')
         fi
-        sfx=""; timeout_args=()
-        if [ -n "$dur" ]; then
-            timeout_args=(--agent-timeout-multiplier "$(awk -v d="$dur" -v t="$base_timeout" 'BEGIN { print d / t }')")
-            [ ${#groups[@]} -gt 1 ] && sfx+="_d$dur"
-        fi
         globs=()
         while IFS= read -r glob; do [ -n "$glob" ] && globs+=("$glob"); done <<<"${groups[$key]}"
-
-        if [ "${SKIP_EXISTING:-0}" != 1 ]; then
-            inc=(); for g in "${globs[@]}"; do inc+=(-i "$g"); done
-            run_job "$ds" "$(job_name "$sfx" "${globs[@]}")" "${timeout_args[@]}" "${inc[@]}"
-            continue
-        fi
-
         globs+=("${cli_globs[@]}")
         [ ${#globs[@]} -gt 0 ] || globs=("*")
-        declare -A need=()   # remaining attempts -> "-i task" args
+
+        if [ "${SKIP_EXISTING:-0}" != 1 ]; then
+            while IFS= read -r t; do
+                task_paths+=("$(variant "$ds/$t" "${dur:-$base_timeout}")"); names+=("$t")
+            done < <(cd "$ds" && for g in "${globs[@]}"; do compgen -G "$g" || true; done | sort -u)
+            continue
+        fi
         skipped=0
         while IFS=$'\t' read -r remaining task have_n have_jobs; do
             if [ "$remaining" -eq 0 ]; then
@@ -342,19 +550,24 @@ run)
                 continue
             fi
             [ "$have_n" -gt 0 ] && echo "SKIP_EXISTING: $task has $have_n of $want_k (in ${have_jobs}); running $remaining more" >&2
-            need[$remaining]+="$task"$'\n'
+            p=$(variant "$ds/$task" "${dur:-$base_timeout}"); names+=("$task")
+            for ((i = 0; i < remaining; i++)); do task_paths+=("$p"); done
         done < <(python3 skip_existing.py --jobs jobs --dataset "$ds" --agent "$agent" ${CC_VERSION:+--agent-version "$CC_VERSION"} \
-                    --budget "$BUDGET" --max-dur "$dur" --k "$want_k" --server "$srv_file" "${globs[@]}")
+                    --budget "$BUDGET" --think-budget "$THINK_BUDGET" --max-dur "${dur:-$base_timeout}" --k "$want_k" --server "$srv_file" "${globs[@]}")
         [ $skipped -gt 0 ] && echo "SKIP_EXISTING: skipped $skipped task(s) in $ds (listed above)" >&2
-        for remaining in "${!need[@]}"; do
-            inc=(); names=()
-            while IFS= read -r t; do [ -n "$t" ] && { inc+=(-i "$t"); names+=("$t"); }; done <<<"${need[$remaining]}"
-            sub=$(job_name "$sfx$([ ${#need[@]} -gt 1 ] && echo "_k$remaining")" "${names[@]}")
-            echo "SKIP_EXISTING: running $(( ${#inc[@]} / 2 )) task(s) x $remaining attempt(s) -> $sub" >&2
-            run_job "$ds" "$sub" "${timeout_args[@]}" "${inc[@]}" -k "$remaining"
-        done
-        unset need
     done
+    if [ ${#task_paths[@]} -eq 0 ]; then
+        echo "nothing to run" >&2
+    else
+        # one base limit for the whole run -> run-settings.txt; mixed = blank (collect.py derives it)
+        base_dur=$(printf '%s\n' "${base_durs[@]}" | sort -u); [[ "$base_dur" == *$'\n'* ]] && base_dur=""
+        job=$(job_name "" $(printf '%s\n' "${names[@]}" | sort -u))
+        mkdir -p "jobs/$job"
+        printf '%s\n' "${task_paths[@]}" | python3 -c 'import json,sys; print(json.dumps({"tasks": [{"path": l.strip()} for l in sys.stdin if l.strip()]}, indent=1))' \
+            > "jobs/$job/harbor-tasks.json"
+        echo "job $job: ${#task_paths[@]} trial(s) of $(printf '%s\n' "${names[@]}" | sort -u | wc -l) task(s)" >&2
+        run_job "$job" -c "jobs/$job/harbor-tasks.json"
+    fi
     # keep results/harbor-trials.tsv current (it's a full rebuild from jobs/, so cheap to redo)
     python3 collect.py jobs >/dev/null || echo "WARNING: collect.py failed; run ./harbor/harbor.sh collect" >&2
     exit $rc

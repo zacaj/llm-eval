@@ -35,6 +35,20 @@ else:
 DEFAULT_ORACLE_SECRET = os.environ.get("ORACLE_SECRET", "tb-secret-please-change")
 
 
+# (fork) harbor/expected-totals.tsv: language, exercise, tests_total
+EXPECTED_TOTALS = Path(__file__).resolve().parents[2] / "expected-totals.tsv"
+
+
+def load_expected_totals() -> Dict[tuple, int]:
+    if not EXPECTED_TOTALS.exists():
+        return {}
+    rows = {}
+    for line in EXPECTED_TOTALS.read_text(encoding="utf-8").splitlines()[1:]:
+        lang, ex, n = line.split("\t")
+        rows[(lang, ex)] = int(n)
+    return rows
+
+
 class AiderPolyglotTask:
     """Represents a single Polyglot exercise, driven purely by config.json."""
 
@@ -454,6 +468,12 @@ class AiderPolyglotAdapter:
         script.chmod(0o755)
         # (fork) partial-credit counter called at the end of test.sh
         shutil.copy2(self.templates_dir / "count_tests.sh", tests_dir / "count_tests.sh")
+        # (fork) known test total from a passing oracle run (harbor/expected-totals.tsv,
+        # written by collect.py): count_tests.sh never reports fewer, so tests that
+        # never ran (crash/abort/timeout) count as failed
+        total = load_expected_totals().get((task.language, task.exercise_name))
+        if total:
+            (tests_dir / "expected_total").write_text(f"{total}\n", encoding="utf-8")
 
     # ---------- (fork) Triggerable hidden tests ------------------------------
 
@@ -506,7 +526,7 @@ RUN chown -R tester:tester /opt/hidden-tests && chmod 700 /opt/hidden-tests \\
 You can check your solution against the hidden unit tests (you cannot read them) by
 running `run-tests` in a shell. You have {limit} test runs in total. After your
 {limit}th run your session ends immediately and your code is graded as it is at that
-moment.
+moment. Each run's output is also saved to /var/lib/run-tests/run-<N>.txt.
 """, encoding="utf-8")
 
         toml = output_dir / "task.toml"

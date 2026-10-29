@@ -1,0 +1,17 @@
+language	exercise	tests_total
+cpp	bank-account	17
+cpp	sublist	18
+go	bowling	31
+go	simple-linked-list	14
+go	tree-building	17
+java	ledger	11
+java	satellite	6
+javascript	triangle	19
+javascript	zipper	19
+python	beer-song	8
+python	bowling	31
+python	paasio	25
+python	sgf-parsing	23
+rust	forth	50
+rust	poker	37
+rust	simple-cipher	23

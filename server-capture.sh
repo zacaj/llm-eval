@@ -205,31 +205,34 @@ while i < len(args):
 measure_decode_tps() {
   local i out resp tps=""
   # Strata: /metrics already holds decode speed from real requests (totals
-  # since start, else the live mean) -- free, no probe load. But it's empty
-  # on a freshly started server, so fall through to a real probe then.
+  # since start, else the live mean of a long in-progress generation) -- free,
+  # no probe load. Only trusted once it covers enough output: right after a
+  # restart the totals are a few tiny requests (1-token capture probes) whose
+  # per-request overhead reads as ~10 tok/s; then fall through to a real probe.
   if [[ "$TARGET" == "strata" ]]; then
     tps="$(curl -sf --max-time 10 "$LLAMA_SERVER_URL/metrics" 2>/dev/null | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 t = d.get("totals", {})
-if t.get("decode_ms") and t.get("output_tokens"):
+live = d.get("live") or {}
+if t.get("decode_ms") and (t.get("output_tokens") or 0) >= 2000:
     print(t["output_tokens"] / (t["decode_ms"] / 1000))
-elif d.get("live", {}).get("tok_s_mean"):
-    print(d["live"]["tok_s_mean"])
+elif live.get("tok_s_mean") and (live.get("generated") or 0) >= 500:
+    print(live["tok_s_mean"])
 ' 2>/dev/null)" || tps=""
     if [[ -n "$tps" ]]; then echo "$tps"; return 0; fi
     echo "-- /metrics has no decode stats yet (fresh server?); probing with a real completion" >&2
   fi
-  # Probe: two 200-token completions (the first pays one-time warmup), reading
+  # Probe: two 600-token completions (the first pays one-time warmup), reading
   # the server's own timings.predicted_per_second. Strata has no /completion,
   # so it gets the OpenAI chat endpoint (which also returns timings).
   local url body
   if [[ "$TARGET" == "strata" ]]; then
     url="$LLAMA_SERVER_URL/v1/chat/completions"
-    body='{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Write a short paragraph about the history of bridges."}],"max_tokens":200,"temperature":0.6,"stream":false}'
+    body='{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Write a detailed multi-section essay about the history of bridges."}],"max_tokens":600,"temperature":0.6,"stream":false}'
   else
     url="${LLAMA_HEALTH_URL%/health}/completion"
-    body='{"prompt":"Write a short paragraph about the history of bridges.","n_predict":200,"temperature":0.6}'
+    body='{"prompt":"Write a detailed multi-section essay about the history of bridges.","n_predict":600,"temperature":0.6}'
   fi
   for i in 1 2; do
     resp="$(curl -sS --max-time 180 "$url" -H 'Content-Type: application/json' -d "$body" 2>&1)" || { echo "-- decode probe $i/2 against $url: curl failed: ${resp:0:300}" >&2; continue; }
@@ -238,4 +241,31 @@ elif d.get("live", {}).get("tok_s_mean"):
     [[ "$out" =~ ^[0-9.]+$ ]] && tps="$out"
   done
   echo "$tps"
+}
+
+# Strata only: what thinking settings a real request ends up with, read from the
+# server's own strata_effective (after any proxy filters and engine mapping -- e.g.
+# effort "high" resolves to "xhigh"). Send it through the same URL/headers as the
+# real requests. Args: base URL, Anthropic-dialect JSON fields to merge (what the
+# caller sends, e.g. {"output_config":{"effort":"low"},"thinking":{"type":"adaptive"}}),
+# then extra "Header: value" lines. Emits srv.eff.reasoning_{effort,budget,budget_source}.
+# max_tokens 1 keeps it cheap; the budget is read from reasoning_budget_requested
+# (before Strata shrinks it to fit max_tokens). Silent no-op if not reported.
+probe_strata_reasoning() {
+  local base="$1" fields="$2"; shift 2
+  python3 -I -c '
+import json, sys, urllib.request
+base, fields = sys.argv[1], json.loads(sys.argv[2] or "{}")
+body = {"model": "x", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+body.update(fields)
+hdrs = {"Content-Type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "x"}
+for h in sys.argv[3:]:
+    k, _, v = h.partition(":"); hdrs[k.strip()] = v.strip()
+req = urllib.request.Request(base + "/v1/messages", json.dumps(body).encode(), hdrs)
+eff = json.load(urllib.request.urlopen(req, timeout=300)).get("strata_effective") or {}
+for src, dst in (("reasoning_effort", "reasoning_effort"),
+                 ("reasoning_budget_requested", "reasoning_budget"),
+                 ("reasoning_budget_source", "reasoning_budget_source")):
+    if eff.get(src) is not None: print(f"srv.eff.{dst}={eff[src]}")
+' "$base" "$fields" "$@" 2>/dev/null || true
 }

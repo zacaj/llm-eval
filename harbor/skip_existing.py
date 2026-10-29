@@ -30,7 +30,8 @@ SERVER_KEYS = re.compile(
 
 def server_sig(text: str) -> dict[str, str]:
     kv = dict(l.split("=", 1) for l in text.splitlines() if "=" in l)
-    return {k: v for k, v in kv.items() if SERVER_KEYS.match(k)}
+    # *_source keys say where a value came from (e.g. "backfilled"), not what ran
+    return {k: v for k, v in kv.items() if SERVER_KEYS.match(k) and not k.endswith("_source")}
 
 
 def task_timeout(task_dir: Path) -> float:
@@ -70,6 +71,7 @@ def main() -> None:
     ap.add_argument("--agent", required=True)
     ap.add_argument("--agent-version", default="")
     ap.add_argument("--budget", type=int, default=0)
+    ap.add_argument("--think-budget", type=int, default=0)
     ap.add_argument("--max-dur", default="")
     ap.add_argument("--k", type=int, default=1)
     ap.add_argument("--server", type=Path, required=True)
@@ -94,6 +96,12 @@ def main() -> None:
         m = re.search(r"X-Eval-Budget\W+(\d+)", cj)
         if (int(m.group(1)) if m else 0) != a.budget:
             continue
+        # thinking cap (run-settings.txt think_budget, written by harbor.sh); jobs from before
+        # it was set ran at Strata's default cap, so they never match a set budget
+        rs = job / "run-settings.txt"
+        tb = re.search(r"^think_budget=(\d+)$", rs.read_text(), re.M) if rs.exists() else None
+        if ((int(tb.group(1)) or None) if tb else None) != (a.think_budget or None):
+            continue
         mult = cfg.get("agent_timeout_multiplier") or cfg.get("timeout_multiplier") or 1.0
         for res in job.glob("*/result.json"):
             tdir = res.parent
@@ -105,10 +113,14 @@ def main() -> None:
                 continue
             if a.agent_version and info.get("version") != a.agent_version:
                 continue
-            task = Path((json.loads((tdir / "config.json").read_text())["task"]["path"])).name
+            task_path = Path(json.loads((tdir / "config.json").read_text())["task"]["path"])
+            task = task_path.name
             if task not in have:
                 continue
-            limit = round(task_timeout(a.dataset / task) * mult)
+            # the task.toml the trial ran: harbor.sh's tasks/_dur/<secs>/ copies carry
+            # their own limit (fall back to the dataset's if that copy is gone)
+            src = task_path if (task_path / "task.toml").exists() else a.dataset / task
+            limit = round(task_timeout(src) * mult)
             want_limit = round(float(a.max_dur)) if a.max_dur else round(task_timeout(a.dataset / task))
             if time_limit_matches(r, limit, want_limit):
                 have[task] += 1
