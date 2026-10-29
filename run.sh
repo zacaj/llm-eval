@@ -465,11 +465,11 @@ from datetime import datetime, timezone
 
 $_WRITE_TSV_PY
 
-per_test_tsv_file, run_dir, cmd_name, model, srv_file, since_ts = sys.argv[1:7]
+per_test_tsv_file, run_dir, cmd_name, model, srv_file, since_ts, px_log = sys.argv[1:8]
 since_ts = float(since_ts)
 run_dir = Path(run_dir)
 aider_settings = {}
-for kv in sys.argv[7:]:
+for kv in sys.argv[8:]:
     k, _, v = kv.partition('=')
     aider_settings[k] = v
 
@@ -495,12 +495,67 @@ for fname in run_dir.glob('*/exercises/practice/*/.aider.results.json'):
     rel = fname.relative_to(run_dir).parts  # (language, 'exercises', 'practice', exercise, '.aider.results.json')
     data['_language'] = rel[0]
     data['_exercise'] = rel[3] if len(rel) > 4 else fname.parent.name
+    data['_mtime'] = mtime
     results.append(data)
     max_mtime = max(max_mtime, mtime)
 
 if not results:
     print(since_ts)
     sys.exit(0)
+
+# eval proxy rows (results/eval-proxy.tsv) for one exercise: its X-Eval-Session tag,
+# within the exercise's own time window (a rerun into the same dir adds new rows)
+px_rows = []
+if os.path.isfile(px_log):
+    with open(px_log, newline='') as f:
+        px_rows = list(csv.DictReader(f, delimiter='\t'))
+def px_stats(run_name, lang, ex, end_ts, duration):
+    tag = f'{run_name}/{lang}/{ex}'
+    lo = end_ts - duration - 120
+    mine = []
+    for row in px_rows:
+        if row.get('session') != tag:
+            continue
+        try:
+            ts = datetime.fromisoformat(row['timestamp']).timestamp()
+        except (KeyError, ValueError):
+            continue
+        if lo <= ts <= end_ts + 60:
+            mine.append(row)
+    if not mine:
+        return {}
+    num = lambda row, k: int(row[k]) if (row.get(k) or '').isdigit() else 0
+    uniq = lambda k: ','.join(sorted({row[k] for row in mine if row.get(k)}))
+    return {'px_requests': str(len(mine)),
+            'px_output_tokens': str(sum(num(row, 'output_tokens') for row in mine)),
+            'px_reasoning_tokens': str(sum(num(row, 'reasoning_tokens') for row in mine)),
+            'px_answer_tokens': str(sum(num(row, 'answer_tokens') for row in mine)),
+            'px_budget_cutoffs': str(sum(num(row, 'budget_cutoff') for row in mine)),
+            'px_effort': uniq('effort'), 'px_reasoning_budget': uniq('reasoning_budget'),
+            # time the model spent on requests (incl. prompt processing): tok/s without test runs
+            'px_model_sec': str(round(sum(num(row, 'duration_ms') for row in mine) / 1000))}
+
+# Counts from the exercise's .aider.chat.history.md: aider's own counters mix these up
+# (num_user_asks = its auto-answered confirm prompts, num_error_outputs = server AND
+# model errors), and the transcript is overwritten when the run dir is reused, so it's
+# captured here. Same patterns as results/outcomes.py HISTORY_PATTERNS.
+import re
+HIST_PATTERNS = {
+    'hist_auth_errors':   r'AuthenticationError',
+    'hist_server_errors': r'ServiceUnavailableError|Loading model|InternalServerError|Connection error|APIConnectionError',
+    'hist_context':       r'exceeds the available context|possibly exhausted context window',
+    'hist_output_limit':  r'possibly exceeded output limit',
+    'hist_edit_format':   r'did not conform to the edit format',
+    'hist_lint':          r'Attempt to fix lint errors\?',
+    'hist_wrong_file':    r'Create new file\?|Allow edits to file that has not been added',
+}
+def hist_stats(lang, ex):
+    h = run_dir / lang / 'exercises' / 'practice' / ex / '.aider.chat.history.md'
+    try:
+        text = h.read_text(errors='replace')
+    except OSError:
+        return {}
+    return {k: str(len(re.findall(p, text))) for k, p in HIST_PATTERNS.items()}
 
 timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 per_test_rows = []
@@ -532,6 +587,8 @@ for r in results:
     t_row['prompt_tokens'] = str(r.get('prompt_tokens', 0) or 0)
     t_row['completion_tokens'] = str(r.get('completion_tokens', 0) or 0)
     t_row['aider_commit'] = r.get('commit_hash', '') or ''
+    t_row.update(px_stats(run_dir.name, r.get('_language', ''), r.get('_exercise', ''), r.get('_mtime', 0), r.get('duration', 0) or 0))
+    t_row.update(hist_stats(r.get('_language', ''), r.get('_exercise', '')))
     per_test_rows.append(t_row)
 
 TEST_STATIC = ['timestamp', 'run_cmd', 'language', 'exercise', 'model']
@@ -539,13 +596,17 @@ TEST_STATS = ['pass', 'passed_at_try', 'tries_taken', 'cost', 'duration',
               'error_outputs', 'num_malformed_responses', 'syntax_errors',
               'indentation_errors', 'user_asks', 'lazy_comments',
               'exhausted_context_windows', 'bailed_on_max_duration', 'test_timeouts',
-              'prompt_tokens', 'completion_tokens', 'aider_commit']
+              'prompt_tokens', 'completion_tokens', 'aider_commit',
+              'px_requests', 'px_output_tokens', 'px_reasoning_tokens', 'px_answer_tokens',
+              'px_budget_cutoffs', 'px_effort', 'px_reasoning_budget', 'px_model_sec',
+              'hist_auth_errors', 'hist_server_errors', 'hist_context', 'hist_output_limit',
+              'hist_edit_format', 'hist_lint', 'hist_wrong_file']
 write_tsv(per_test_tsv_file, TEST_STATIC, TEST_STATS, per_test_rows)
 
 names = ', '.join(r['exercise'] for r in per_test_rows)
 print(f'  +{len(per_test_rows)} per-test row(s): {names}', file=sys.stderr)
 print(max_mtime)
-" "$PER_TEST_TSV" "$run_dir" "$cmd_name" "$AIDER_MODEL" "$srv_file" "$since_ts" \
+" "$PER_TEST_TSV" "$run_dir" "$cmd_name" "$AIDER_MODEL" "$srv_file" "$since_ts" "$EVAL_PROXY_LOG" \
       "edit_format=$edit_format" "tries=$TRIES" "max_tokens=$MAX_TOKENS" \
       "reasoning_effort=$REASONING_EFFORT" "request_timeout=$REQUEST_TIMEOUT" \
       "target=$TARGET" "temperature=$TEMPERATURE" "seed=$SEED" "or_provider=$OR_PROVIDER" "or_reasoning_tokens=$OR_REASONING_TOKENS" "extra_body=$EXTRA_BODY"
@@ -770,9 +831,40 @@ _on_benchmark_interrupt() {
 }
 trap _on_benchmark_interrupt INT TERM
 
+# Eval proxy (harbor/eval_proxy.py, shared with harbor.sh): sits between the aider
+# container and LLAMA_BASE_URL and logs one row per request to results/eval-proxy.tsv
+# with what the server says it did (Strata's strata_effective: effort, thinking
+# budget, reasoning/answer tokens, budget cut-off). The benchmark tags each
+# exercise's requests with X-Eval-Session (patches/patch_benchmark_session_header.py),
+# so track_per_test can add per-exercise px_* columns. Requests reach the upstream
+# unchanged. Started once per run.sh invocation on 127.0.0.1 (the container uses
+# host networking); skipped for remote MODEL=x/y specs and with EVAL_PROXY=0.
+_RUN_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL_PROXY_LOG="$_RUN_SH_DIR/results/eval-proxy.tsv"
+_EVAL_PROXY_PID=""
+start_eval_proxy() {
+  [[ -n "$_EVAL_PROXY_PID" || "$MODEL" == */* || "${EVAL_PROXY:-1}" == 0 ]] && return 0
+  local out port
+  out="$(mktemp)"
+  python3 "$_RUN_SH_DIR/harbor/eval_proxy.py" --bind 127.0.0.1 --upstream "${LLAMA_BASE_URL%/v1}" \
+    --log "$EVAL_PROXY_LOG" > "$out" 2>&1 &
+  _EVAL_PROXY_PID=$!
+  for _ in $(seq 50); do grep -q listening "$out" && break; sleep 0.1; done
+  port="$(awk '/listening/ {print $2}' "$out")"
+  if [[ -z "$port" ]]; then
+    echo "WARNING: eval proxy failed to start, running without it: $(cat "$out")" >&2
+    kill "$_EVAL_PROXY_PID" 2>/dev/null; _EVAL_PROXY_PID=""
+  else
+    export LLAMA_BASE_URL="http://127.0.0.1:$port/v1"
+  fi
+  rm -f "$out"
+}
+trap '[[ -n "$_EVAL_PROXY_PID" ]] && kill "$_EVAL_PROXY_PID" 2>/dev/null' EXIT
+
 run_benchmark_and_track() {
   local run_dir="$1" cmd_name="$2" edit_format="$3"
   shift 3
+  start_eval_proxy
 
   local container srv_file
   srv_file="$(mktemp)"
