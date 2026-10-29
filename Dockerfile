@@ -141,3 +141,10 @@ RUN mkdir -p /results && chmod a+rwx /results
 COPY patches/patch_benchmark_strip_timings.py /tmp/patch_benchmark_strip_timings.py
 RUN python3 /tmp/patch_benchmark_strip_timings.py /aider/benchmark/benchmark.py \
     && rm /tmp/patch_benchmark_strip_timings.py
+
+# X-Eval-Session header per exercise, so run.sh's eval proxy (harbor/eval_proxy.py)
+# can attribute each logged request to an exercise -- see
+# patches/patch_benchmark_session_header.py. Last layer so adding it reuses the cache.
+COPY patches/patch_benchmark_session_header.py /tmp/patch_benchmark_session_header.py
+RUN python3 /tmp/patch_benchmark_session_header.py /aider/benchmark/benchmark.py \
+    && rm /tmp/patch_benchmark_session_header.py
