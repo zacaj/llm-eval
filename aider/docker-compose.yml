@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - ./results:/results
+      - ../runs/aider:/results
       # "full-" variants of exercises whose helper files the stock harness hides
       # from the model (see extra-exercises/README.md); read-only, copied per run
       - ./extra-exercises/java/exercises/practice/full-word-search:/benchmarks/polyglot-benchmark/java/exercises/practice/full-word-search:ro

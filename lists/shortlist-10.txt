@@ -1,0 +1,42 @@
+# Shortlist of 15 aider-polyglot exercises for quick model comparison.
+# Baseline: Qwen3.6-35B-A3B-Claude-Opus-Distilled-MTP-UD-IQ3_XXS, 'full' run (100 exercises, 71% pass).
+# Selected to span the pass/fail boundary -- skips trivial gimmes and hopeless fails.
+#
+# Format: <language>\t<exercise>\t[<max_tries>]\t[<max_duration>]
+# (also accepts bare "<exercise>" lines, run across all languages, but those
+# never take overrides). Comment lines (#) and blank lines are ignored.
+# max_tries/max_duration are optional per-exercise overrides for TRIES/MAX_DUR
+# ("-" or omit to use this run's global default -- see run.sh's own defaults
+# and comments); exercises are grouped by effective (tries, max_dur) and each
+# group gets its own benchmark.py invocation, so mixing overrides in one file
+# costs nothing extra beyond the group count. Consumed by:
+#   ./run.sh fromfile results/shortlist-15.txt
+#
+# language     exercise                  max_tries  max_dur   baseline_result  passed_at_try/6  duration_s
+
+javascript     triangle                  2 # pass  1  5.4
+javascript     grade-school              3 # pass  1  18.2
+
+go             two-bucket                4 # pass  4  76.2
+javascript     tournament                4 # pass  2  91.3
+go             book-store                5 # pass  3  141.0
+go             bowling                   6  1200  # pass  6  356.4
+cpp            clock                     4  4000  # fail  -  711.7
+
+cpp            spiral-matrix             4  3600  # fail  -  5500.6
+go             paasio                    4  1800  # fail  -  60.2
+
+# Added 8/25: java/rust picks (shortlist above never tests either language), chosen because both
+# were near the pass/fail boundary in the single full-224-exercise baseline run despite that run
+# capping tries at 6 -- direct testing since then (multiple models, some repeated trials) showed
+# real successes landing on try 7-8, so 6 was cutting off genuinely-still-converging attempts
+# rather than a hard capability wall. Raised max_tries to 10 per your steer (worth the extra
+# headroom given per-try cost here is cheap -- see below -- unlike the "6 was already plenty"
+# finding from the earlier, much longer run against the original shortlist above). max_dur sized
+# per-exercise off actual observed per-try costs across all models/trials run today (Darwin
+# Q4_K_XL was consistently the slowest, ~50-131s/try depending on exercise) x10 tries + buffer,
+# not a single shared value -- poker is both the slowest and the most variable of the three so it
+# gets the most headroom.
+java           satellite                 10  800   # pass  6  165.4
+java           poker                     10  1800  # pass  6  275.1
+rust           dot-dsl                   10  1000  # pass  6  168.6

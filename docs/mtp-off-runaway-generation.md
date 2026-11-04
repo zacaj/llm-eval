@@ -60,7 +60,7 @@ to GPU`, `MoE cache disabled`; its only change was context 262144 -> 94976).
 Same pattern on the full 8-exercise list (`27b-diff-list.txt`): auto-fit/no-MTP 2/8 in 2479s,
 MTP on 5/8 in 592-692s. Result dirs: `results/fromfile-27b-diff-list-openai-Darwin-35B-A3B-Opus-unsloth-UD-IQ3_XXS-MTP-zacaj{,-vram-mtp,-vram-mtp-notpl,-moe-rerun}`,
 `results/fromfile-alpha-only-...{-vram-nomtp,-vram-mtp-95k}`. Per-exercise rows are in
-`eval-results-per-test.tsv` (model name carries the suffix).
+`aider-results-per-test.tsv` (model name carries the suffix).
 
 ## Ruled out
 

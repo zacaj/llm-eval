@@ -10,7 +10,7 @@ set -euo pipefail
 # (writes docker-compose.override.yml, `docker compose up -d`, blocks until a
 # real completion succeeds -- not just /health, and dies with recent logs on
 # a crash/timeout instead of hanging), run the eval via ./run.sh (which
-# already tracks results into results/eval-results.tsv -- see run.sh's
+# already tracks results into results/aider-results.tsv -- see run.sh's
 # track_eval), move to the next combo.
 #
 # This USES your persistent llama-cpp-turboquant `llama-cpp` compose service
@@ -64,7 +64,7 @@ set -euo pipefail
 # script just execs `MODEL=$ALIAS ./run.sh "$RUN_CMD" ...` per combo:
 #   CONFIGS="ModelA.gguf,ModelB.gguf,ModelC.gguf" \
 #     SKIP_EXISTING=1 SEED_TRIES=2 \
-#     ./sweep.sh fromfile results/some-exercise-list.txt
+#     ./sweep.sh fromfile lists/some-exercise-list.txt
 # (no trailing -- --clean needed: the exercise-list path is just the next
 # positional arg after run-cmd, and --clean is added automatically since
 # nothing else here already implies --clean/-c/--resume)
@@ -126,13 +126,16 @@ set -euo pipefail
 #                          turboquant-fit-vs-manual-moe-offload notes. 0
 #                          (default) disables the check.
 #
-# Output: every combo's row lands in results/eval-results.tsv via run.sh's
+# Output: every combo's row lands in results/aider-results.tsv via run.sh's
 # own tracking, tagged with that combo's actual server settings (model,
 # sampling, -ctk/-ctv, etc. — see run.sh's SRV_BLACKLIST for what's
 # excluded). This script additionally copies just this sweep's rows to
-# results/sweep-<timestamp>.tsv and prints them at the end.
+# runs/aider/sweep-<timestamp>.tsv and prints them at the end.
 
+export CALLER_PWD="${CALLER_PWD:-$PWD}"   # run.sh resolves relative list paths against it
 cd "$(dirname "$0")"
+source ../lib/paths.sh
+AIDER_RUNS="$RUNS_DIR/aider"
 
 # The model server (llama-cpp-turboquant in docker inside WSL) lives on the NAS,
 # not on this host: LLAMA_REPO_DIR/MCFG are paths ON the NAS, and everything
@@ -329,10 +332,10 @@ for i in "${!TAGS[@]}"; do
   fi
 done
 
-# ── Summary: just this sweep's rows out of the shared eval-results.tsv ─────
+# ── Summary: just this sweep's rows out of the shared aider-results.tsv ─────
 
-TRACK_TSV="${TRACK_TSV:-$(pwd)/results/eval-results.tsv}"
-SWEEP_TSV="results/sweep-$(date +%Y%m%dT%H%M%S).tsv"
+TRACK_TSV="${TRACK_TSV:-$DATA_DIR/aider-results.tsv}"
+SWEEP_TSV="$AIDER_RUNS/sweep-$(date +%Y%m%dT%H%M%S).tsv"
 
 if [ -f "$TRACK_TSV" ]; then
   python3 -c "

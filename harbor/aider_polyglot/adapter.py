@@ -35,8 +35,8 @@ else:
 DEFAULT_ORACLE_SECRET = os.environ.get("ORACLE_SECRET", "tb-secret-please-change")
 
 
-# (fork) harbor/expected-totals.tsv: language, exercise, tests_total
-EXPECTED_TOTALS = Path(__file__).resolve().parents[2] / "expected-totals.tsv"
+# (fork) harbor/aider_polyglot/expected-totals.tsv: language, exercise, tests_total
+EXPECTED_TOTALS = Path(__file__).resolve().parent / "expected-totals.tsv"
 
 
 def load_expected_totals() -> Dict[tuple, int]:
@@ -468,7 +468,7 @@ class AiderPolyglotAdapter:
         script.chmod(0o755)
         # (fork) partial-credit counter called at the end of test.sh
         shutil.copy2(self.templates_dir / "count_tests.sh", tests_dir / "count_tests.sh")
-        # (fork) known test total from a passing oracle run (harbor/expected-totals.tsv,
+        # (fork) known test total from a passing oracle run (harbor/aider_polyglot/expected-totals.tsv,
         # written by collect.py): count_tests.sh never reports fewer, so tests that
         # never ran (crash/abort/timeout) count as failed
         total = load_expected_totals().get((task.language, task.exercise_name))

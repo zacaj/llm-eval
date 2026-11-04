@@ -1,0 +1,16 @@
+# Harder differentiator set: exercises that failed or needed late tries in the full-224 run.
+javascript     alphametics               6  1500
+javascript     wordy                     6  1500
+javascript     promises                  6  1500
+javascript     house                     6  1500
+javascript     scale-generator           6  1500
+python         forth                     6  1500
+python         sgf-parsing               6  1500
+java           food-chain                6  1500
+java           rational-numbers          6  1500
+go             palindrome-products       6  1500
+go             say                       6  1500
+go             simple-linked-list        6  1500
+cpp            sublist                   6  2000
+rust           acronym                   6  1500
+rust           simple-cipher             6  1500

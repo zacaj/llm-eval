@@ -16,7 +16,7 @@ time-consuming) unit test subprocess -- so a stuck/slow try still finishes
 naturally rather than being killed mid-generation, and the next try just
 never starts once the budget is blown. Surfaces whether this fired via a new
 `bailed_on_max_duration` field in run_test_real's results dict, so it's
-distinguishable in eval-results-per-test.tsv from a exercise that genuinely
+distinguishable in aider-results-per-test.tsv from a exercise that genuinely
 used and exhausted all --tries.
 
 Usage: patch_benchmark_max_duration.py <path-to-benchmark.py>

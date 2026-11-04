@@ -1,0 +1,8 @@
+# Harder set for top builds: failed or needed late tries in the full-224 run, none tried yet in 27b-diff-list.
+javascript     forth                     6  2000
+javascript     zebra-puzzle              6  2000
+python         pov                       6  2000
+go             connect                   6  2000
+rust           grep                      6  2000
+java           word-search               6  2000
+java           rational-numbers          6  2000

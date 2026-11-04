@@ -25,11 +25,11 @@ set -euo pipefail
 #   ./harbor/harbor.sh run claude-code -i 'polyglot_python_*' -l 5
 #   ./harbor/harbor.sh run terminus-2  -i 'polyglot_rust_*' -k 3
 #   ./harbor/harbor.sh run oracle      -i 'polyglot_cpp_*' -n 8     # verifier sanity check, no model
-#   ./harbor/harbor.sh run claude-code --list harbor/lists/smoke-per-language.txt -k 3
+#   ./harbor/harbor.sh run claude-code --list smoke-per-language -k 3
 #
 # --list FILE: exercise list in run.sh's fromfile format ("<language> <exercise>
 # [max_tries] [max_dur]" or bare "<exercise>" = every language; "#" comments), so
-# the results/*.txt shortlists work as-is. Each entry becomes an `-i` include
+# the lists/*.txt shortlists work as-is. Each entry becomes an `-i` include
 # glob. max_dur (seconds) is honoured: entries are grouped by it and each group
 # runs as its own Harbor job (suffix -d<secs>) with a matching
 # --agent-timeout-multiplier. max_tries has no Harbor equivalent (ignored, warned).
@@ -53,7 +53,7 @@ set -euo pipefail
 #              eval_proxy.py (see EVAL_PROXY_HOST below)
 #   SERVER_URL model server itself, not the proxy (default http://$NAS_HOST:8080); its
 #              sampling/quality settings are saved to jobs/<job>/server-settings.txt
-#              (same capture as run.sh's srv.* columns, via ../server-capture.sh)
+#              (same capture as run.sh's srv.* columns, via ../lib/server-capture.sh)
 #   SKIP_EXISTING  1 = treat -k N as "ensure N graded attempts" per task and only run
 #              what's missing, counting matching earlier trials from any job (same
 #              agent+version/BUDGET/time limit (or finished within it)/server sampling+model; INVALID and ungraded
@@ -76,7 +76,7 @@ set -euo pipefail
 #              llama (-> timeouts); web tools let the model fetch the exercise's real
 #              tests from GitHub. Recorded in run-settings.txt; set "" to allow all.
 #   CC_VERSION Claude Code version to run (default: the one pre-installed in the task
-#              images, ARG CC_VERSION in adapters/aider_polyglot/task-template/Dockerfile;
+#              images, ARG CC_VERSION in aider_polyglot/task-template/Dockerfile;
 #              a different value makes Harbor install it per trial)
 #   PROXY_FILTERS  1 (default) = the proxy's prompt filters (tuned for local models)
 #              still rewrite Claude Code's system prompt/tools; 0 = stock prompts
@@ -85,6 +85,18 @@ set -euo pipefail
 # Anything after <agent> is forwarded to `harbor run`, so later flags win.
 
 cd "$(dirname "$0")"
+source ../lib/paths.sh
+# jobs/, tasks/, polyglot-benchmark/ are symlinks into runs/harbor/ (gitignored); job and
+# trial configs record task paths relative to this dir, so the links keep old jobs readable
+mkdir -p "$RUNS_DIR/harbor/jobs" "$RUNS_DIR/harbor/tasks"
+# list file: relative to the caller's cwd, else a name under lists/ (".txt" optional)
+resolve_list() {
+    local c
+    for c in "$1" "$OLDPWD/$1" "$LISTS_DIR/$1" "$LISTS_DIR/$1.txt"; do
+        [[ "$c" = /* && -f "$c" ]] && { echo "$c"; return; }
+    done
+    echo "$1"
+}
 
 HARBOR=(uvx harbor@0.25.0)
 BASE_URL="${BASE_URL:-http://192.168.2.15:3002}"
@@ -160,7 +172,7 @@ list_entries() {
                     if [ ! -d "$tds/$tglob" ]; then
                         [ -n "$TB2_SRC" ] || { echo "missing $tds/$tglob: set TB2_SRC=<terminal-bench-2 checkout> to generate it" >&2; exit 1; }
                         echo "generating missing test-calls task $tglob" >&2
-                        python3 adapters/tb2_tc/main.py --src "$TB2_SRC" --tasks "$task" --test-calls "$calls" >&2
+                        python3 tb2/main.py --src "$TB2_SRC" --tasks "$task" --test-calls "$calls" >&2
                     fi
                 else
                     tglob="${task}__tc*"
@@ -187,7 +199,7 @@ list_entries() {
                 glob+="__tc$tries"
                 if [ "$lang" != "*" ] && [ ! -d "$TC_DATASET/$glob" ]; then
                     echo "generating missing test-calls task $glob" >&2
-                    ORACLE_SECRET=$(openssl rand -hex 16) python3 adapters/aider_polyglot/main.py \
+                    ORACLE_SECRET=$(openssl rand -hex 16) python3 aider_polyglot/main.py \
                         --output-dir "$TC_DATASET" --task-ids "${lang}_${ex}" --test-calls "$tries" \
                         2>&1 | grep -E "^(Generated|Error)" >&2
                 fi
@@ -218,14 +230,14 @@ decode_tps() (
     LLAMA_SERVER_URL="$SERVER_URL" LLAMA_HEALTH_URL="$SERVER_URL/health" MODEL="${model:-x}"
     TARGET=llama-nas
     curl -sf --max-time 10 "$SERVER_URL/health" | grep -q '"service": *"strata"' && TARGET=strata
-    source ../server-capture.sh
+    source ../lib/server-capture.sh
     measure_decode_tps
 )
 
 capture_server() (
     LLAMA_SERVER_URL="$SERVER_URL" LLAMA_DOCKER=(docker -H "ssh://$NAS_HOST")
     MODEL="${model:-x}" TEMPERATURE=server SEED=0 EXTRA_BODY=""
-    source ../server-capture.sh
+    source ../lib/server-capture.sh
     if curl -sf --max-time 10 "$SERVER_URL/health" | grep -q '"service": *"strata"'; then
         echo "srv.target=strata"
         # the probe has to send a seed; harbor requests never do (Strata picks one per request)
@@ -259,7 +271,7 @@ case "$cmd" in
 gen)
     # Fresh secret per generation: upstream's default oracle key is public, and
     # the encrypted reference solution sits in the agent's workspace.
-    ORACLE_SECRET=$(openssl rand -hex 16) python3 adapters/aider_polyglot/main.py "$@"
+    ORACLE_SECRET=$(openssl rand -hex 16) python3 aider_polyglot/main.py "$@"
     ;;
 run)
     agent="${1:?usage: harbor.sh run <agent> [harbor args...]}"; shift
@@ -268,7 +280,7 @@ run)
     while [ $# -gt 0 ]; do
         if [ "$1" = "--list" ]; then
             # resolve relative to the caller's cwd, not this script's dir
-            f="$2"; [[ "$f" = /* ]] || f="$OLDPWD/$f"; list_file="$f"
+            f=$(resolve_list "$2"); list_file="$f"
             n=0
             while IFS=$'\t' read -r ds dur glob; do
                 groups["$ds|$dur"]+="$glob"$'\n'; n=$((n + 1))
@@ -281,7 +293,7 @@ run)
     done
     [ ${#groups[@]} -gt 0 ] || groups["$DATASET|-"]=""
 
-    # Known test totals (expected-totals.tsv -> tasks' tests/expected_total) let the
+    # Known test totals (aider_polyglot/expected-totals.tsv -> tasks' tests/expected_total) let the
     # verifier count tests that never ran as failed. For any selected exercise without
     # one, first run the oracle on its classic task (no model needed, so before any
     # SWAP_CMD), let collect.py record the total, and regenerate the selected tasks of
@@ -302,7 +314,7 @@ run)
                 [[ "$t" =~ ^polyglot_([a-z]+)_(.+)$ ]] || continue
                 lang="${BASH_REMATCH[1]}"; ex="${BASH_REMATCH[2]%__tc*}"
                 awk -F'\t' -v l="$lang" -v e="$ex" '$1 == l && $2 == e { f = 1 } END { exit !f }' \
-                    expected-totals.tsv 2>/dev/null || need+=("$ds/$t")
+                    aider_polyglot/expected-totals.tsv 2>/dev/null || need+=("$ds/$t")
             done < <(cd "$ds" && for x in "${g[@]}"; do compgen -G "$x" || true; done | sort -u)
         done
         if [ ${#need[@]} -gt 0 ]; then
@@ -312,24 +324,24 @@ run)
             ( unset SWAP_CMD; CHECK="auto: expected test totals (EXPECTED_PREFILL)" TC=0 DATASET="" \
                 SKIP_EXISTING=0 MAX_DUR="" MAX_DUR_SCALE=1 "$PWD/harbor.sh" run oracle "${oi[@]}" ) \
                 || echo "EXPECTED_PREFILL: oracle run failed; continuing without totals" >&2
-            # that run's collect.py updated expected-totals.tsv; regenerate what we're about to run
-            ORACLE_SECRET=$(openssl rand -hex 16) python3 adapters/aider_polyglot/main.py \
+            # that run's collect.py updated aider_polyglot/expected-totals.tsv; regenerate what we're about to run
+            ORACLE_SECRET=$(openssl rand -hex 16) python3 aider_polyglot/main.py \
                 --task-ids "$(echo $exs | tr ' ' ',')" >/dev/null
             for p in "${need[@]}"; do
                 [[ "$p" =~ /polyglot_([a-z]+)_(.+)__tc([0-9]+)$ ]] || continue
-                ORACLE_SECRET=$(openssl rand -hex 16) python3 adapters/aider_polyglot/main.py \
+                ORACLE_SECRET=$(openssl rand -hex 16) python3 aider_polyglot/main.py \
                     --output-dir "$TC_DATASET" --task-ids "${BASH_REMATCH[1]}_${BASH_REMATCH[2]}" \
                     --test-calls "${BASH_REMATCH[3]}" >/dev/null
             done
             for e in $exs; do
-                awk -F'\t' -v k="$e" '$1 "_" $2 == k { f = 1 } END { exit !f }' expected-totals.tsv \
+                awk -F'\t' -v k="$e" '$1 "_" $2 == k { f = 1 } END { exit !f }' aider_polyglot/expected-totals.tsv \
                     || echo "EXPECTED_PREFILL: WARNING: oracle didn't pass for $e; its test total stays unknown" >&2
             done
         fi
     fi
 
     base_timeout=$(task_agent_timeout)
-    [ "$agent" = claude-code ] && CC_VERSION=${CC_VERSION:-$(sed -n 's/^ARG CC_VERSION=//p' adapters/aider_polyglot/task-template/Dockerfile 2>/dev/null)}
+    [ "$agent" = claude-code ] && CC_VERSION=${CC_VERSION:-$(sed -n 's/^ARG CC_VERSION=//p' aider_polyglot/task-template/Dockerfile 2>/dev/null)}
     # SWAP_CMD='ssh ... llm strata foo': command that loads the model to evaluate. With
     # SKIP_EXISTING=1 it only runs if some task still needs attempts. The server's settings
     # (needed to match earlier trials) are unknown until it's loaded, so the pre-check uses
@@ -392,7 +404,7 @@ run)
         export ANTHROPIC_BASE_URL="$EVAL_URL" ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY_LOCAL:-local}"
         # pinned agent version: matches the image's pre-installed build (task-template/Dockerfile
         # CC_VERSION) so Harbor skips its per-trial install; also part of SKIP_EXISTING's match
-        CC_VERSION=${CC_VERSION:-$(sed -n 's/^ARG CC_VERSION=//p' adapters/aider_polyglot/task-template/Dockerfile 2>/dev/null)}
+        CC_VERSION=${CC_VERSION:-$(sed -n 's/^ARG CC_VERSION=//p' aider_polyglot/task-template/Dockerfile 2>/dev/null)}
         parallel_args=()
         [ "$PARALLEL_TOOLS" = 1 ] && parallel_args=(--ak "append_system_prompt=$PARALLEL_TOOLS_PROMPT")
         # EFFORT=off: Claude Code's effort level must still be a real level, and thinking is switched off
@@ -491,7 +503,7 @@ run)
         [ "$agent" = claude-code ] && printf 'disallowed_tools=%s\nparallel_tools=%s\n' "$DISALLOWED_TOOLS" "$PARALLEL_TOOLS" >> "jobs/$job/run-settings.txt"
         proxy_pid=""   # global: the EXIT trap below stops it if we're interrupted
         if ! [[ "$agent" =~ ^(oracle|nop)$ ]]; then
-            python3 eval_proxy.py --port "$EVAL_PROXY_PORT" --upstream "$BASE_URL" \
+            python3 ../lib/eval_proxy.py --port "$EVAL_PROXY_PORT" --upstream "$BASE_URL" \
                 ${server_model:+--model "$server_model"} \
                 --think-budget "$THINK_BUDGET" --answer-tokens "$ANSWER_TOKENS" \
                 --log "jobs/$job/eval-proxy.tsv" > "jobs/$job/eval-proxy.out" 2>&1 &
@@ -629,12 +641,12 @@ run)
     ;;
 gen-tc)
     if [ "${1:-}" = "--list" ]; then
-        f="${2:?gen-tc --list FILE}"; [[ "$f" = /* ]] || f="$OLDPWD/$f"
+        f=$(resolve_list "${2:?gen-tc --list FILE}")
         sel=(--test-calls-file "$f")
     else
         sel=(--task-ids "${1:?language}_${2:?exercise}" --test-calls "${3:?calls}")
     fi
-    ORACLE_SECRET=$(openssl rand -hex 16) python3 adapters/aider_polyglot/main.py \
+    ORACLE_SECRET=$(openssl rand -hex 16) python3 aider_polyglot/main.py \
         --output-dir "$TC_DATASET" "${sel[@]}"
     ;;
 collect)

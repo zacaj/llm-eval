@@ -57,9 +57,12 @@ set -euo pipefail
 #   ./run.sh stats <run-dir>                # regenerate stats from a completed run
 #   ./run.sh shell                          # open interactive shell in container
 #
-# Results go to ./results/<run-name>/
+# Per-run output goes to runs/aider/<run-name>/; tracked rows to results/aider-results*.tsv
 
+CALLER_PWD="${CALLER_PWD:-$PWD}"   # relative list paths resolve against the caller's cwd
 cd "$(dirname "$0")"
+source ../lib/paths.sh
+AIDER_RUNS="$RUNS_DIR/aider"
 
 # ── Target server ───────────────────────────────────────────────────────────
 # This eval host is NOT the machine running the model server any more. TARGET
@@ -350,7 +353,7 @@ export AIDER_BENCHMARK_MAX_DUR="$(scale_max_dur "$MAX_DUR")"
 export AIDER_BENCHMARK_MAX_CHAT_HISTORY_TOKENS="$MAX_CHAT_HISTORY_TOKENS"
 DOCKER_RUN="docker compose run --rm -e AIDER_BENCHMARK_MAX_DUR -e AIDER_BENCHMARK_MAX_CHAT_HISTORY_TOKENS benchmark"
 
-mkdir -p results
+mkdir -p "$AIDER_RUNS"
 
 # Snapshot before the docker run starts, so track_per_test/track_aggregate
 # can scope their aggregation to files this invocation actually wrote (see
@@ -365,23 +368,23 @@ RUN_START_TS="$(date +%s)"
 # are unaffected -- same start value, same behavior as before.
 TRACK_WATERMARK="$RUN_START_TS"
 
-# ── Result tracking (eval-results.tsv) ──────────────────────────────────────
+# ── Result tracking (aider-results.tsv) ──────────────────────────────────────
 # After each benchmark run, snapshot the llama-server's current model/sampling
 # settings (via `docker inspect`, same trick as bench-replay.sh) alongside
 # aider's own eval config and the run's aggregate pass-rate stats, then append
-# one row to eval-results.tsv. Columns grow/shrink automatically as flags
+# one row to aider-results.tsv. Columns grow/shrink automatically as flags
 # change across runs (dynamic-header merge, same as bench-replay.sh).
 
-TRACK_TSV="${TRACK_TSV:-$(pwd)/results/eval-results.tsv}"
+TRACK_TSV="${TRACK_TSV:-$DATA_DIR/aider-results.tsv}"
 # One row per exercise per run (language, exercise name, pass/fail, tries
 # taken, tokens, cost, ...) alongside the same run/model/server settings
 # columns as TRACK_TSV, so per-exercise questions ("did model A handle
 # zipper better than model B") are a plain filter on one file instead of
 # needing to dig through individual .aider.chat.history.md transcripts.
-PER_TEST_TSV="${PER_TEST_TSV:-$(pwd)/results/eval-results-per-test.tsv}"
+PER_TEST_TSV="${PER_TEST_TSV:-$DATA_DIR/aider-results-per-test.tsv}"
 # Server settings capture (detect_llama_container, capture_srv_settings,
 # strata_settings_effective, ...): shared with harbor/harbor.sh
-source "$(dirname "${BASH_SOURCE[0]}")/server-capture.sh"
+source "$EVAL_DIR/lib/server-capture.sh"
 
 # Shared dynamic-header TSV writer, embedded in both track_per_test and
 # track_aggregate below (each is its own `python3 -c`, a fresh interpreter,
@@ -503,7 +506,7 @@ if not results:
     print(since_ts)
     sys.exit(0)
 
-# eval proxy rows (results/eval-proxy.tsv) for one exercise: its X-Eval-Session tag,
+# eval proxy rows (results/aider-eval-proxy.tsv) for one exercise: its X-Eval-Session tag,
 # within the exercise's own time window (a rerun into the same dir adds new rows)
 px_rows = []
 if os.path.isfile(px_log):
@@ -538,7 +541,7 @@ def px_stats(run_name, lang, ex, end_ts, duration):
 # Counts from the exercise's .aider.chat.history.md: aider's own counters mix these up
 # (num_user_asks = its auto-answered confirm prompts, num_error_outputs = server AND
 # model errors), and the transcript is overwritten when the run dir is reused, so it's
-# captured here. Same patterns as results/outcomes.py HISTORY_PATTERNS.
+# captured here. Same patterns as results/viz/outcomes.py HISTORY_PATTERNS.
 import re
 HIST_PATTERNS = {
     'hist_auth_errors':   r'AuthenticationError',
@@ -795,14 +798,14 @@ print(f'  [{row[\"timestamp\"]}] {cmd_name} model={model} seed={row[\"seed\"]}: 
 # swallowed) so callers/set -e still see a real failure as a failure.
 POLL_INTERVAL="${POLL_INTERVAL:-15}"
 
-# Regenerates results/eval-viz.html from PER_TEST_TSV; called whenever new per-test
+# Regenerates results/viz/eval-viz.html from PER_TEST_TSV; called whenever new per-test
 # rows land. Best-effort: a viz failure must never fail or stall the benchmark run.
 # VIZ_REFRESH=0 disables it.
 VIZ_REFRESH="${VIZ_REFRESH:-1}"
 refresh_viz() {
   [[ "$VIZ_REFRESH" == "0" ]] && return 0
   local dir
-  dir="$(dirname "$PER_TEST_TSV")"
+  dir="$(dirname "$PER_TEST_TSV")/viz"
   [[ -f "$dir/generate_viz_data.py" ]] || return 0
   (cd "$dir" && python3 generate_viz_data.py >/dev/null 2>&1) \
     || echo "WARNING: viz refresh failed (run generate_viz_data.py in $dir to see why)" >&2
@@ -831,8 +834,8 @@ _on_benchmark_interrupt() {
 }
 trap _on_benchmark_interrupt INT TERM
 
-# Eval proxy (harbor/eval_proxy.py, shared with harbor.sh): sits between the aider
-# container and LLAMA_BASE_URL and logs one row per request to results/eval-proxy.tsv
+# Eval proxy (lib/eval_proxy.py, shared with harbor.sh): sits between the aider
+# container and LLAMA_BASE_URL and logs one row per request to results/aider-eval-proxy.tsv
 # with what the server says it did (Strata's strata_effective: effort, thinking
 # budget, reasoning/answer tokens, budget cut-off). The benchmark tags each
 # exercise's requests with X-Eval-Session (patches/patch_benchmark_session_header.py),
@@ -840,13 +843,13 @@ trap _on_benchmark_interrupt INT TERM
 # unchanged. Started once per run.sh invocation on 127.0.0.1 (the container uses
 # host networking); skipped for remote MODEL=x/y specs and with EVAL_PROXY=0.
 _RUN_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EVAL_PROXY_LOG="$_RUN_SH_DIR/results/eval-proxy.tsv"
+EVAL_PROXY_LOG="$DATA_DIR/aider-eval-proxy.tsv"
 _EVAL_PROXY_PID=""
 start_eval_proxy() {
   [[ -n "$_EVAL_PROXY_PID" || "$MODEL" == */* || "${EVAL_PROXY:-1}" == 0 ]] && return 0
   local out port
   out="$(mktemp)"
-  python3 "$_RUN_SH_DIR/harbor/eval_proxy.py" --bind 127.0.0.1 --upstream "${LLAMA_BASE_URL%/v1}" \
+  python3 "$EVAL_DIR/lib/eval_proxy.py" --bind 127.0.0.1 --upstream "${LLAMA_BASE_URL%/v1}" \
     --log "$EVAL_PROXY_LOG" > "$out" 2>&1 &
   _EVAL_PROXY_PID=$!
   for _ in $(seq 50); do grep -q listening "$out" && break; sleep 0.1; done
@@ -980,13 +983,13 @@ join_lines_comma() {
 # exercises across 6 languages"). Stable repo structure, safe to hardcode.
 POLYGLOT_LANGUAGES="cpp go java javascript python rust"
 
-EXERCISE_LIST_CACHE_DIR="results/.exercise-lists"
+EXERCISE_LIST_CACHE_DIR="$AIDER_RUNS/.exercise-lists"
 
 # Real exercise directory names for a language, queried once from inside the
 # container (there's no way to know these ahead of time without asking the
 # image what polyglot-benchmark actually contains -- it's not mounted on the
 # host) and cached to disk so repeat runs don't pay the container-startup
-# cost again. Delete results/.exercise-lists/ to force a re-list (e.g. after
+# cost again. Delete runs/aider/.exercise-lists/ to force a re-list (e.g. after
 # rebuilding the image against a newer polyglot-benchmark).
 list_exercises() {
   local lang="$1"
@@ -1042,7 +1045,7 @@ local_reasoning_budget() {
 
 write_model_settings() {
   local fmt="${1:-$EDIT_FORMAT}"
-  # Per-model filename (not a single shared results/.model-settings.yml) so
+  # Per-model filename (not a single shared runs/aider/.model-settings.yml) so
   # two runs against different models don't overwrite each other's timeout/
   # max_tokens mid-run -- aider matches entries by exact model name, and a
   # shared file means whichever run wrote last silently wins for every other
@@ -1050,7 +1053,7 @@ write_model_settings() {
   # not "openai/$MODEL" -- for a MODEL already containing '/' (e.g.
   # openrouter/<vendor>/<slug>), the old hardcoded openai/ prefix never
   # matched the real model name, so extra_params silently never applied.
-  local f="results/.model-settings-${MODEL_SLUG}-${SAMPLING_SLUG}.yml"
+  local f="$AIDER_RUNS/.model-settings-${MODEL_SLUG}-${SAMPLING_SLUG}.yml"
   cat > "$f" <<EOF
 - name: $AIDER_MODEL
   edit_format: $fmt
@@ -1121,10 +1124,10 @@ common_flags() {
 do_clean() {
   local run_dir="$1"
   [[ -d "$run_dir" ]] || return 0
-  mkdir -p results/OLD
-  local dest="results/OLD/$(basename "$run_dir")"
+  mkdir -p "$AIDER_RUNS/OLD"
+  local dest="$AIDER_RUNS/OLD/$(basename "$run_dir")"
   if [[ -e "$dest" ]]; then
-    dest="results/OLD/$(date +%Y-%m-%d-%H-%M-%S)-$(basename "$run_dir")"
+    dest="$AIDER_RUNS/OLD/$(date +%Y-%m-%d-%H-%M-%S)-$(basename "$run_dir")"
   fi
   echo "Moving stale $run_dir -> $dest" >&2
   mv "$run_dir" "$dest"
@@ -1162,7 +1165,7 @@ guard_reuse() {
   if [[ -d "$run_dir" ]] && find "$run_dir" -name ".aider.results.json" -print -quit 2>/dev/null | grep -q .; then
     if [[ $has_clean -eq 0 && $has_resume -eq 0 ]]; then
       echo "ERROR: $run_dir already has results from a previous run." >&2
-      echo "Pass --clean to start fresh (moves old results to results/OLD/<name>)," >&2
+      echo "Pass --clean to start fresh (moves old results to runs/aider/OLD/<name>)," >&2
       echo "or --resume to continue/reuse the existing results as-is." >&2
       exit 1
     fi
@@ -1341,7 +1344,7 @@ run_python_subset() {
   local name="$1" default_n="$2" forced_format="$3"
   shift 3
   split_exercise_args "$@"
-  auto_clean "results/$name" "${PASSTHRU_ARGS[@]}"
+  auto_clean "$AIDER_RUNS/$name" "${PASSTHRU_ARGS[@]}"
   local num_tests
   if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
     validate_exercises python "${EXERCISE_ARGS[@]}"
@@ -1353,7 +1356,7 @@ run_python_subset() {
   fi
   local fmt="${forced_format:-$EDIT_FORMAT}"
   write_model_settings "$fmt"
-  run_benchmark_and_track "results/$name" "$name" "$fmt" \
+  run_benchmark_and_track "$AIDER_RUNS/$name" "$name" "$fmt" \
     "/results/$name" \
     --model "$AIDER_MODEL" \
     --edit-format "$fmt" \
@@ -1409,9 +1412,9 @@ case "$CMD" in
       echo "(${EXERCISE_ARGS[*]}) defeats the point; use 'quick <names>' instead." >&2
       exit 1
     fi
-    auto_clean results/random "${PASSTHRU_ARGS[@]}"
+    auto_clean $AIDER_RUNS/random "${PASSTHRU_ARGS[@]}"
     write_model_settings
-    run_benchmark_and_track results/random random "$EDIT_FORMAT" \
+    run_benchmark_and_track $AIDER_RUNS/random random "$EDIT_FORMAT" \
       /results/random \
       --model "$AIDER_MODEL" \
       --edit-format "$EDIT_FORMAT" \
@@ -1427,14 +1430,14 @@ case "$CMD" in
 
   python)
     split_exercise_args "${@:2}"
-    guard_reuse results/python "${PASSTHRU_ARGS[@]}"
+    guard_reuse $AIDER_RUNS/python "${PASSTHRU_ARGS[@]}"
     if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
       validate_exercises python "${EXERCISE_ARGS[@]}"
       KEYWORDS="$(IFS=,; echo "${EXERCISE_ARGS[*]}")"
     fi
     write_model_settings
     # All python exercises (~30-40 depending on model speed), or just the named ones
-    run_benchmark_and_track results/python python "$EDIT_FORMAT" \
+    run_benchmark_and_track $AIDER_RUNS/python python "$EDIT_FORMAT" \
       /results/python \
       --model "$AIDER_MODEL" \
       --edit-format "$EDIT_FORMAT" \
@@ -1449,7 +1452,7 @@ case "$CMD" in
 
   polyglot)
     split_exercise_args "${@:2}"
-    auto_clean results/polyglot "${PASSTHRU_ARGS[@]}"
+    auto_clean $AIDER_RUNS/polyglot "${PASSTHRU_ARGS[@]}"
     if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
       KEYWORDS="$(IFS=,; echo "${EXERCISE_ARGS[*]}")"
       POLY_NUM_TESTS="${#EXERCISE_ARGS[@]}"
@@ -1465,7 +1468,7 @@ case "$CMD" in
     fi
     write_model_settings
     # 3 exercises per language, 18 total (or just the named ones)
-    run_benchmark_and_track results/polyglot polyglot "$EDIT_FORMAT" \
+    run_benchmark_and_track $AIDER_RUNS/polyglot polyglot "$EDIT_FORMAT" \
       /results/polyglot \
       --model "$AIDER_MODEL" \
       --edit-format "$EDIT_FORMAT" \
@@ -1480,13 +1483,13 @@ case "$CMD" in
 
   full)
     split_exercise_args "${@:2}"
-    guard_reuse results/full "${PASSTHRU_ARGS[@]}"
+    guard_reuse $AIDER_RUNS/full "${PASSTHRU_ARGS[@]}"
     if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
       KEYWORDS="$(IFS=,; echo "${EXERCISE_ARGS[*]}")"
     fi
     write_model_settings
     # All 225 exercises across all languages, or just the named ones — the real deal
-    run_benchmark_and_track results/full full "$EDIT_FORMAT" \
+    run_benchmark_and_track $AIDER_RUNS/full full "$EDIT_FORMAT" \
       /results/full \
       --model "$AIDER_MODEL" \
       --edit-format "$EDIT_FORMAT" \
@@ -1503,7 +1506,7 @@ case "$CMD" in
     # "<language> <exercise>" or bare "<exercise>", optionally followed by
     # per-exercise "<max_tries> <max_duration>" overrides; '#' starts a
     # comment). See parse_fromfile_entries/compare_to_baseline above and
-    # results/shortlist-15.txt for the expected format. Bare words after the
+    # lists/shortlist-15.txt for the expected format. Bare words after the
     # file path are NOT exercise substrings here (the file already says which
     # exercises to run) -- everything after the path is forwarded as flags,
     # same as --clean/--resume elsewhere.
@@ -1516,6 +1519,10 @@ case "$CMD" in
     # repeat calls just add to the existing dir; --keywords scopes each call
     # to that group's exercises, which never overlap across groups).
     FROMFILE_PATH="${2:?Usage: ./run.sh fromfile <file> [--clean|--resume]}"
+    # relative to the caller's cwd, else a name under lists/ (".txt" optional)
+    for _cand in "$FROMFILE_PATH" "$CALLER_PWD/$FROMFILE_PATH" "$LISTS_DIR/$FROMFILE_PATH" "$LISTS_DIR/$FROMFILE_PATH.txt"; do
+      [[ "$_cand" == /* && -f "$_cand" ]] && { FROMFILE_PATH="$_cand"; break; }
+    done
     [[ -f "$FROMFILE_PATH" ]] || { echo "ERROR: file not found: $FROMFILE_PATH" >&2; exit 1; }
     # Includes the model so two runs against the SAME shortlist file (e.g.
     # comparing several models overnight) never share a results dir. Without
@@ -1734,7 +1741,7 @@ case "$CMD" in
       else
         echo "-- seed $SEED ($SEED_IDX/${#SEED_LIST[@]}): attempting ${#CUR_ENTRIES[@]} exercise(s)" >&2
       fi
-      guard_reuse "results/$RUN_NAME" "${@:3}"
+      guard_reuse "$AIDER_RUNS/$RUN_NAME" "${@:3}"
       write_model_settings
 
       declare -A FROMFILE_GROUP_KEYWORDS=()
@@ -1790,7 +1797,7 @@ case "$CMD" in
       # ENTIRE fromfile run. Without this, one bad group silently skips every
       # remaining exercise, which defeats the point of grouping for exactly
       # the unattended/overnight runs this feature is for.
-      if ! run_benchmark_and_track "results/$RUN_NAME" "$RUN_NAME" "$EDIT_FORMAT" \
+      if ! run_benchmark_and_track "$AIDER_RUNS/$RUN_NAME" "$RUN_NAME" "$EDIT_FORMAT" \
         "/results/$RUN_NAME" \
         --model "$AIDER_MODEL" \
         --edit-format "$EDIT_FORMAT" \
@@ -1808,7 +1815,7 @@ case "$CMD" in
     SEED="$BASE_SEED"
     export AIDER_BENCHMARK_MAX_DUR="$ORIG_MAX_DUR"
 
-    compare_to_baseline "$FROMFILE_PATH" "results/$RUN_NAME"
+    compare_to_baseline "$FROMFILE_PATH" "$AIDER_RUNS/$RUN_NAME"
     ;;
 
   stats)
@@ -1819,7 +1826,7 @@ case "$CMD" in
 
   custom)
     split_exercise_args "${@:2}"
-    guard_reuse results/custom "${PASSTHRU_ARGS[@]}"
+    guard_reuse $AIDER_RUNS/custom "${PASSTHRU_ARGS[@]}"
     if [[ "${#EXERCISE_ARGS[@]}" -gt 0 ]]; then
       KEYWORDS="$(IFS=,; echo "${EXERCISE_ARGS[*]}")"
     fi
@@ -1835,7 +1842,7 @@ case "$CMD" in
       fi
     done
     write_model_settings "$CUSTOM_EDIT_FORMAT"
-    run_benchmark_and_track results/custom custom "$CUSTOM_EDIT_FORMAT" \
+    run_benchmark_and_track $AIDER_RUNS/custom custom "$CUSTOM_EDIT_FORMAT" \
       /results/custom \
       --model "$AIDER_MODEL" \
       --exercises-dir /benchmarks/polyglot-benchmark \
@@ -1861,8 +1868,8 @@ case "$CMD" in
     echo "                            '#' starts a comment -- if it's '# pass|fail <tries|-> <secs>'"
     echo "                            (as written by this project's shortlist-*.txt), the run ends"
     echo "                            with a table of where this model diverged from that baseline."
-    echo "                            Results go to results/fromfile-<basename>/; --clean/--resume"
-    echo "                            work the same as full/python. See results/shortlist-15.txt."
+    echo "                            Results go to runs/aider/fromfile-<basename>/; --clean/--resume"
+    echo "                            work the same as full/python. See lists/shortlist-15.txt."
     echo "                            SKIP_EXISTING=<scopes> (comma list) picks what finished work is"
     echo "                            skipped: pass (passed at ANY seed), seed-pass (passed at THIS"
     echo "                            seed), seed (attempted, pass or fail, at THIS seed), resume ="
@@ -1894,12 +1901,12 @@ case "$CMD" in
     echo "  curl http://100.71.29.121:3002/v1/models"
     echo ""
     echo "smoke/quick/diff/polyglot/random auto-clean their results dir on every run"
-    echo "(old results moved to results/OLD/<name>) so each invocation is independent --"
+    echo "(old results moved to runs/aider/OLD/<name>) so each invocation is independent --"
     echo "pass --resume to opt out and reuse/continue existing results instead."
     echo ""
     echo "python/full can run for hours, so they don't auto-clean -- if their results"
     echo "dir already has results in it, run.sh refuses to proceed until you pass:"
-    echo "  --clean               Move old results to results/OLD/<name>, start fresh"
+    echo "  --clean               Move old results to runs/aider/OLD/<name>, start fresh"
     echo "  --resume              Proceed and let benchmark.py reuse/continue them"
     echo "e.g. ./run.sh full --clean"
     echo ""
@@ -1934,7 +1941,7 @@ case "$CMD" in
     echo "                                        results dir (-xhigh suffix); skip checks only match same effort."
     echo "  REASONING_BUDGET=<n>                  override the thinking-token cap, sent per request (no server"
     echo "                                        restart; recorded in srv.--reasoning-budget). Empty = don't send."
-    echo "  VIZ_REFRESH=0                         don't regenerate results/eval-viz.html after each new result"
+    echo "  VIZ_REFRESH=0                         don't regenerate results/viz/eval-viz.html after each new result"
     echo "  EFFORT_DUR_MULT=<x>                   override the effort's max_dur multiplier (stacks with MAX_DUR_SCALE)"
     echo "  TEMPERATURE=<float>|server            (default: 0.6; server for TARGET=strata) sent per request;"
     echo "                                        0 = greedy; server = send none, the server's own sampling defaults apply"
@@ -1946,22 +1953,22 @@ case "$CMD" in
     echo "  SKIP_EXISTING / SEED_TRIES / SEEDS / SEED_ALWAYS    fromfile-only; see 'fromfile' above"
     echo "  LLAMA_BASE_URL=http://host:port/v1    (default: tailscale :3002)"
     echo "  LLAMA_CONTAINER=<name>                (default: auto-detect running llama-server)"
-    echo "  TRACK_TSV=<path>                      (default: ./results/eval-results.tsv)"
-    echo "  PER_TEST_TSV=<path>                   (default: ./results/eval-results-per-test.tsv)"
+    echo "  TRACK_TSV=<path>                      (default: results/aider-results.tsv)"
+    echo "  PER_TEST_TSV=<path>                   (default: results/aider-results-per-test.tsv)"
     echo ""
-    echo "Results are saved to ./results/"
+    echo "Per-run output is saved to runs/aider/; tracked rows to results/"
     echo ""
     echo "Each run (smoke/quick/python/polyglot/full/diff/custom) appends a row to"
-    echo "eval-results.tsv: aider's pass-rate stats for that run, plus the model's"
+    echo "aider-results.tsv: aider's pass-rate stats for that run, plus the model's"
     echo "current behavior-affecting settings (sampling, KV-cache quant, context"
     echo "handling, chat template) read live off the running llama-server via"
     echo "'docker inspect'. Pure perf/infra flags (threads, GPU-layer split,"
     echo "batching, logging, networking) are excluded so they don't pollute"
     echo "behavior comparisons across runs."
     echo ""
-    echo "It also appends one row per exercise to eval-results-per-test.tsv (same"
+    echo "It also appends one row per exercise to aider-results-per-test.tsv (same"
     echo "settings columns, plus language/exercise/pass/passed_at_try/cost/duration/"
-    echo "... per exercise) -- e.g. grep zipper results/eval-results-per-test.tsv"
+    echo "... per exercise) -- e.g. grep zipper results/aider-results-per-test.tsv"
     echo "to see how every model/config you've run has handled that one exercise."
     echo ""
     echo "Compare runs:"

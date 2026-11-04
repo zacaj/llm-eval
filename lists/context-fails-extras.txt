@@ -1,0 +1,4 @@
+python         sgf-parsing               5  900  # 2-3 on Qwen, fails on opus?, barely Bonsai
+rust    forth                4  500   # base passed on try 4
+java            full-word-search         6  400   # 8!
+go             simple-linked-list        4  400   # 1-4, quick

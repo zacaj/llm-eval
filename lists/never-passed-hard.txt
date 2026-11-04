@@ -1,0 +1,21 @@
+# Hard-candidate list for stumping the Qwen3.8-27B IQ3_XXS quants. Revised 2026-10-02 after the base
+# (Qwen3.8-27B-UD-IQ3_XXS-unsloth) seed-1 pass over the first 16: dropped everything it solved in <=3 tries.
+# Hidden-source-helper exercises (editor files besides cases_test.go) are excluded on purpose.
+# format: <language> <exercise> <tries> <max_dur_s>
+
+# --- kept from run 1 (base: failed or needed 4-6 tries) ---
+#java  bowling              6  600   # base passed on try 6
+#go    connect              8  800   # base passed on try 5
+python paasio              6  600   # never attempted by any model
+#go  paasio              6  600   # never attempted by any model
+#go    forth                6  600   # base passed on try 4
+rust    forth                6  600   # base passed on try 4
+#go    hexadecimal          6  600   # base passed on try 5
+
+
+# java  forth                6  600   # base FAILED (6 tries)  bad test, missing spec info
+#java  rational-numbers     6  600   # base FAILED (6 tries); opus needed 4-6, also bad test
+# rust    dot-dsl                6  600   # base passed on try 4  too easy
+#java  satellite              6  600   # base passed on try 6
+
+

@@ -368,7 +368,7 @@ def thinking_stats(agent_dir: Path) -> dict:
 
 
 def proxy_rows(job_dir: Path) -> list[dict]:
-    """jobs/<job>/eval-proxy.tsv (harbor/eval_proxy.py): one row per model request."""
+    """jobs/<job>/eval-proxy.tsv (lib/eval_proxy.py): one row per model request."""
     f = job_dir / "eval-proxy.tsv"
     if not f.exists():
         return []
@@ -535,7 +535,7 @@ def instr_text(tdir: Path) -> str:
         return ""
 
 
-EXPECTED_TOTALS = Path(__file__).parent / "expected-totals.tsv"
+EXPECTED_TOTALS = Path(__file__).parent / "aider_polyglot" / "expected-totals.tsv"
 
 
 def write_expected_totals(oracle_total: dict[str, int], trials) -> None:
@@ -560,7 +560,7 @@ def write_expected_totals(oracle_total: dict[str, int], trials) -> None:
                                + "".join(f"{l}\t{e}\t{n}\n" for (l, e), n in sorted(rows.items())))
 
 
-COUNT_TESTS = Path(__file__).parent / "adapters/aider_polyglot/task-template/count_tests.sh"
+COUNT_TESTS = Path(__file__).parent / "aider_polyglot/task-template/count_tests.sh"
 
 
 def rescore(tdir: Path, lang: str, rw: dict, expected: int | None) -> dict | None:
@@ -813,12 +813,12 @@ def main() -> None:
     print(f"{n} progress points -> {prog_out}")
     # rebuild the viz whenever the TSVs change (run.sh's refresh_viz does the same after
     # aider runs); VIZ_REFRESH=0 skips it. A failed rebuild is a warning, not a collect failure.
-    gen = a.out.parent / "generate_viz_data.py"
+    gen = a.out.parent / "viz" / "generate_viz_data.py"
     if os.environ.get("VIZ_REFRESH", "1") != "0" and gen.exists():
-        r = subprocess.run([sys.executable, gen.name], cwd=a.out.parent,
+        r = subprocess.run([sys.executable, gen.name], cwd=gen.parent,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if r.returncode:
-            print(f"WARNING: viz refresh failed (run {gen.name} in {a.out.parent} to see why)", file=sys.stderr)
+            print(f"WARNING: viz refresh failed (run {gen.name} in {gen.parent} to see why)", file=sys.stderr)
 
 
 if __name__ == "__main__":

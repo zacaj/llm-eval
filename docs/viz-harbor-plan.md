@@ -164,9 +164,9 @@ Audit findings:
   forward run.sh `track_per_test` writes them as `hist_*` count columns (auth_errors,
   server_errors, context, output_limit, edit_format, lint, wrong_file), backfilled on 1690
   latest rows. Blank = logs gone, unknown. outcomes.py reads only these columns.
-- The 25 `random` auth-failure rows moved to `eval-results-per-test-invalid.tsv` (with
+- The 25 `random` auth-failure rows moved to `aider-results-per-test-invalid.tsv` (with
   `invalid_reason`; that file's header now matches the main TSV). Their aggregate row in
-  `eval-results.tsv` is left as is, since the viz doesn't read that file.
+  `aider-results.tsv` is left as is, since the viz doesn't read that file.
 - **Harbor `tests_parsed=0` fails are real build failures** (Rust borrow/type errors, C++ API
   renames, a Java constructor mismatch), not harness errors -> `build_failed` flag.
 - Not yet checked: whether Harbor timeouts were still making progress (needs the phase-0

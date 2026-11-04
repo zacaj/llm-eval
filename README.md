@@ -6,19 +6,19 @@ Evaluates local LLMs via the [aider polyglot benchmark](https://aider.chat/docs/
 
 ```bash
 # Build the Docker image (first time only, ~5-10 min)
-./run.sh build
+./aider/run.sh build
 
 # Make sure llama.cpp is running on port 3002
 # The model alias (--alias in llama.cpp) is used as the model name
 
 # Smoke test (1 exercise, ~2 min)
-./run.sh smoke
+./aider/run.sh smoke
 
 # Quick eval (5 python exercises, ~10 min)
-./run.sh quick
+./aider/run.sh quick
 
 # Specify a different model alias
-./run.sh quick my-model-alias
+./aider/run.sh quick my-model-alias
 ```
 
 ## Commands
@@ -61,7 +61,7 @@ Results saved to `./results/<timestamp>--<run-name>/`. Each exercise gets:
 ## Comparing Runs
 
 ```bash
-./run.sh shell
+./aider/run.sh shell
 # Inside container:
 ./benchmark/benchmark.py --diffs /results/run1 /results/run2
 ```

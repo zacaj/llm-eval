@@ -1,5 +1,8 @@
-results/
-harbor/tasks/
-harbor/jobs/
-harbor/polyglot-benchmark/
+# nested results repo (combined TSVs + viz), its own git repo
+/results/
+# per-run generated output (runs/aider, runs/harbor/{jobs,tasks,polyglot-benchmark})
+/runs/
+# one-off scripts / lists
+tmp/
 __pycache__/
+.remember/

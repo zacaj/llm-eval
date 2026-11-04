@@ -17,8 +17,8 @@ else:
 
 # Defaults
 DEFAULT_POLYGLOT_URL = "https://github.com/Aider-AI/polyglot-benchmark.git"
-# (fork) laid out as aider-eval/harbor/adapters/aider_polyglot/main.py
-HARBOR_DIR = Path(__file__).resolve().parents[2]
+# (fork) laid out as aider-eval/harbor/aider_polyglot/main.py
+HARBOR_DIR = Path(__file__).resolve().parents[1]
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")

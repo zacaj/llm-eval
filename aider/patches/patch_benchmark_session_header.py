@@ -3,10 +3,10 @@
 
 Adds an `X-Eval-Session: <run dir>/<language>/<exercise>` header (via the
 model's extra_params.extra_headers, which litellm sends on every completion)
-so the eval proxy run.sh puts in front of the model server (harbor/eval_proxy.py)
+so the eval proxy run.sh puts in front of the model server (lib/eval_proxy.py)
 can attribute each request it logs -- with the server's own report of effort,
 thinking budget, reasoning/answer tokens and budget cut-offs -- to an exercise.
-track_per_test then sums those into the px_* columns of eval-results-per-test.tsv.
+track_per_test then sums those into the px_* columns of aider-results-per-test.tsv.
 
 Aider requests carry no session id of their own, and with --threads > 1
 exercises interleave, so timing alone can't attribute them.
