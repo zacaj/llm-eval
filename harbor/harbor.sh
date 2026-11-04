@@ -47,7 +47,8 @@ set -euo pipefail
 #   MAX_DUR_SCALE  multiplier on every agent time limit (list max_dur, MAX_DUR, or the
 #              task default) for slower models, as in run.sh: a number (default 1) or
 #              auto = max(1, AUTO_SCALE_BASE_TPS(100) / the server's measured decode tok/s).
-#              Job names / max_dur column / SKIP_EXISTING use the scaled limit.
+#              Job names / max_dur column use the scaled limit; SKIP_EXISTING matches
+#              on the unscaled one, so auto-scale drift between jobs doesn't split runs.
 #   BUDGET     per-trial output-token budget (default 0 = unlimited), enforced by
 #              eval_proxy.py (see EVAL_PROXY_HOST below)
 #   SERVER_URL model server itself, not the proxy (default http://$NAS_HOST:8080); its
@@ -63,7 +64,11 @@ set -euo pipefail
 #              recorded as srv.eff.reasoning_effort / srv.eff.reasoning_budget.
 #              Also sets the thinking cap (eval_proxy.py --think-budget): low 6000,
 #              medium 12000, high/xhigh 24000; max_tokens = cap + ANSWER_TOKENS.
-#   THINK_BUDGET   override the thinking cap (0 = leave the request as Claude Code sent it)
+#              off = reasoning disabled: Claude Code gets CLAUDE_CODE_DISABLE_THINKING=1
+#              and the proxy sends thinking {"type":"disabled"} (THINK_BUDGET=-1), so
+#              terminus-2 is covered too.
+#   THINK_BUDGET   override the thinking cap (0 = leave the request as Claude Code sent it,
+#              -1 = thinking disabled)
 #   ANSWER_TOKENS  answer/tool-call headroom added to the cap for max_tokens (default 8000)
 #   DISALLOWED_TOOLS  Claude Code tools removed for evals (--disallowedTools; default
 #              Agent,WebFetch,WebSearch). Agent: subagents swap the prompt back and forth,
@@ -96,6 +101,9 @@ EVAL_URL="http://$EVAL_PROXY_HOST:$EVAL_PROXY_PORT"
 # 0 = classic for everything. An explicit DATASET overrides all of it.
 CLASSIC_DATASET=tasks/aider_polyglot
 TC_DATASET=tasks/aider_polyglot_tc
+TB2_DATASET=tasks/tb2
+TB2_TC_DATASET=tasks/tb2_tc
+TB2_SRC="${TB2_SRC:-}"   # terminal-bench-2 checkout, only to generate a missing tb2_tc task
 TC="${TC:-}"
 DATASET_FORCED="${DATASET:-}"
 if [ -z "$DATASET_FORCED" ]; then
@@ -109,7 +117,8 @@ case "$EFFORT" in
   low)          _THINK_BUDGET=8000 ;;
   medium)       _THINK_BUDGET=16000 ;;
   high|xhigh)   _THINK_BUDGET=32000 ;;
-  *) echo "ERROR: EFFORT='$EFFORT' is not one of low|medium|xhigh (high = xhigh)." >&2; exit 1 ;;
+  off)          _THINK_BUDGET=-1 ;;   # reasoning disabled (see EFFORT in the header)
+  *) echo "ERROR: EFFORT='$EFFORT' is not one of low|medium|xhigh|off (high = xhigh)." >&2; exit 1 ;;
 esac
 THINK_BUDGET="${THINK_BUDGET:-$_THINK_BUDGET}"
 ANSWER_TOKENS="${ANSWER_TOKENS:-8000}"
@@ -126,7 +135,8 @@ SERVER_URL="${SERVER_URL:-http://$NAS_HOST:3002}"
 LANGS=" python go rust javascript java cpp "
 
 # Print one "<dataset>\t<max_dur or ->\t<include glob>" line per entry of a
-# fromfile-format list (dataset per the TC rules above), generating any missing
+# fromfile-format list (polyglot rows, or TB2 rows `<task> [calls] [max_dur]` for a
+# task dir under tasks/tb2; dataset per the TC rules above), generating any missing
 # __tc<count> test-calls task on the way.
 list_entries() {
     local file="$1" warned=0 line lang ex tries dur
@@ -135,6 +145,34 @@ list_entries() {
         line="${line%%#*}"
         read -r lang ex tries dur <<<"$line"
         [ -z "$lang" ] && continue
+        if [[ "$LANGS" != *" $lang "* && -d "$TB2_DATASET/$lang" ]]; then
+            # Terminal-Bench 2 row: <task> [calls] [max_dur]; calls -> tb2_tc/<task>__tc<calls>
+            local task="$lang" calls="$ex" tds="$TB2_DATASET" tglob="$lang" tdir
+            dur="$tries"
+            [[ "$calls" =~ ^[0-9]+$ ]] || { calls=""; dur="$ex"; }
+            [[ "$dur" =~ ^[0-9]+$ ]] || dur=""
+            if [ -n "$DATASET_FORCED" ]; then
+                tds="$DATASET_FORCED"
+            elif [ "$TC" = 1 ] || { [ -z "$TC" ] && [ -n "$calls" ]; }; then
+                tds="$TB2_TC_DATASET"
+                if [ -n "$calls" ]; then
+                    tglob="${task}__tc$calls"
+                    if [ ! -d "$tds/$tglob" ]; then
+                        [ -n "$TB2_SRC" ] || { echo "missing $tds/$tglob: set TB2_SRC=<terminal-bench-2 checkout> to generate it" >&2; exit 1; }
+                        echo "generating missing test-calls task $tglob" >&2
+                        python3 adapters/tb2_tc/main.py --src "$TB2_SRC" --tasks "$task" --test-calls "$calls" >&2
+                    fi
+                else
+                    tglob="${task}__tc*"
+                fi
+            fi
+            if [ -z "$dur" ] && [ -z "$MAX_DUR" ]; then   # the task's own agent timeout
+                tdir=$(cd "$tds" 2>/dev/null && compgen -G "$tglob" | head -1)
+                [ -n "$tdir" ] && dur=$(awk '/^\[agent\]/{a=1;next} /^\[/{a=0} a && /^timeout_sec/{print int($3); exit}' "$tds/$tdir/task.toml")
+            fi
+            printf '%s\t%s\t%s\n' "$tds" "${dur:--}" "$tglob"
+            continue
+        fi
         if [[ "$LANGS" != *" $lang "* ]]; then
             ex="$lang"; lang="*"; tries=""; dur=""   # bare exercise: all languages, no overrides
         fi
@@ -196,8 +234,11 @@ capture_server() (
         # thinking settings as a Claude Code request resolves them: through the proxy
         # (filters apply) with the effort harbor.sh passes
         if [ "${agent:-}" = claude-code ]; then
-            probe_strata_reasoning "$BASE_URL" \
-                "{\"output_config\": {\"effort\": \"$EFFORT\"}, \"thinking\": {\"type\": \"adaptive\"}}" \
+            probe_body="{\"output_config\": {\"effort\": \"$EFFORT\"}, \"thinking\": {\"type\": \"adaptive\"}}"
+            # eval_proxy.py rewrites thinking to the explicit THINK_BUDGET; probe what it sends
+            [ "$THINK_BUDGET" -gt 0 ] && probe_body="{\"output_config\": {\"effort\": \"$EFFORT\"}, \"thinking\": {\"type\": \"enabled\", \"budget_tokens\": $THINK_BUDGET}, \"reasoning_budget_tokens\": $THINK_BUDGET}"
+            [ "$EFFORT" = off ] && probe_body='{"thinking": {"type": "disabled"}}'
+            probe_strata_reasoning "$BASE_URL" "$probe_body" \
                 "X-Eval-Budget: 1000" $([ "$PROXY_FILTERS" = 0 ] && echo "X-Eval-Filters:0")
         fi
     else
@@ -317,13 +358,13 @@ run)
                 else pscale="$MAX_DUR_SCALE"; fi
                 todo=0
                 for key in "${!groups[@]}"; do
-                    pds="${key%%|*}"; pdur="${key#*|}"; [ "$pdur" = "-" ] && pdur="$MAX_DUR"
+                    pds="${key%%|*}"; pdur="${key#*|}"; [ "$pdur" = "-" ] && pdur="$MAX_DUR"; pbase="${pdur:-$base_timeout}"
                     if [ "$pscale" != 1 ]; then pdur=$(awk -v d="${pdur:-$base_timeout}" -v s="$pscale" 'BEGIN { printf "%.0f", d * s }'); fi
                     pg=(); while IFS= read -r g; do [ -n "$g" ] && pg+=("$g"); done <<<"${groups[$key]}"
                     pg+=("${pglobs[@]}"); [ ${#pg[@]} -gt 0 ] || pg=("*")
                     while IFS=$'\t' read -r rem _; do todo=$((todo + rem)); done < <(
                         python3 skip_existing.py --jobs jobs --dataset "$pds" --agent "$agent" ${CC_VERSION:+--agent-version "$CC_VERSION"} \
-                            --budget "$BUDGET" --think-budget "$THINK_BUDGET" --max-dur "$pdur" --k "$pk" --server "$prev/server-settings.txt" "${pg[@]}")
+                            --budget "$BUDGET" --think-budget "$THINK_BUDGET" --max-dur "${pdur:-$base_timeout}" --max-dur-base "$pbase" --k "$pk" --server "$prev/server-settings.txt" "${pg[@]}")
                 done
                 if [ "$todo" -eq 0 ]; then
                     echo "SWAP_CMD: nothing left to run (per $prev); not swapping models" >&2
@@ -354,12 +395,16 @@ run)
         CC_VERSION=${CC_VERSION:-$(sed -n 's/^ARG CC_VERSION=//p' adapters/aider_polyglot/task-template/Dockerfile 2>/dev/null)}
         parallel_args=()
         [ "$PARALLEL_TOOLS" = 1 ] && parallel_args=(--ak "append_system_prompt=$PARALLEL_TOOLS_PROMPT")
+        # EFFORT=off: Claude Code's effort level must still be a real level, and thinking is switched off
+        claude_effort=$EFFORT; think_off_args=()
+        if [ "$EFFORT" = off ]; then claude_effort=low; think_off_args=(--ae CLAUDE_CODE_DISABLE_THINKING=1); fi
         agent_args=(-m "anthropic/$model" ${CC_VERSION:+--ak "version=$CC_VERSION"}
             ${DISALLOWED_TOOLS:+--ak "disallowed_tools=$DISALLOWED_TOOLS"}
             "${parallel_args[@]}"
             # no telemetry/autoupdate/background title calls hitting the model server
             --ae CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-            --ae "CLAUDE_CODE_EFFORT_LEVEL=$EFFORT"
+            --ae "CLAUDE_CODE_EFFORT_LEVEL=$claude_effort"
+            "${think_off_args[@]}"
             # newline-separated; proxy keys the budget on Claude Code's per-session metadata.user_id
             --ae "ANTHROPIC_CUSTOM_HEADERS=$hdrs")
         ;;
@@ -476,13 +521,20 @@ run)
                 --timeout "${PROGRESS_TIMEOUT:-90}" > "jobs/$job/progress-sampler.log" 2>&1 &
             progress_pid=$!
         fi
+        # written up front (Harbor creates jobs/$job immediately) so the live collect above
+        # already sees srv.* -- without it, mid-run trials have no srv.-m and the viz shows
+        # them under the bare agent model alias as a separate model
+        if [ -n "$srv_before" ]; then
+            ( for _ in $(seq 60); do [ -d "jobs/$job" ] && break; sleep 1; done
+              [ -d "jobs/$job" ] && printf '%s\n' "$srv_before" > "jobs/$job/server-settings.txt" ) &
+        fi
         "${HARBOR[@]}" run -y -a "$agent_spec" "${agent_args[@]}" \
             -n 1 -o jobs --job-name "$job" "$@" "${passthru[@]}" || rc=$?
         kill "$watch_pid" 2>/dev/null || true
         [ -z "$progress_pid" ] || kill "$progress_pid" 2>/dev/null || true
         [ -z "$proxy_pid" ] || kill "$proxy_pid" 2>/dev/null || true
         if [ -n "$srv_before" ] && [ -d "jobs/$job" ]; then
-            printf '%s\n' "$srv_before" > "jobs/$job/server-settings.txt"
+            [ -f "jobs/$job/server-settings.txt" ] || printf '%s\n' "$srv_before" > "jobs/$job/server-settings.txt"
             srv_after=$(capture_server 2>/dev/null || true)
             if [ "$srv_after" != "$srv_before" ]; then
                 printf '%s\n' "$srv_after" > "jobs/$job/server-settings-after.txt"
@@ -522,6 +574,9 @@ run)
         rsync -a --delete "$src/" "$dst/"
         awk -v t="$secs" '/^\[/{a=($0=="[agent]")} a && /^timeout_sec/{$0="timeout_sec = " t ".0"} {print}' \
             "$src/task.toml" > "$dst/task.toml"
+        # instructions that state the limit (tb2_tc) get the copy's limit
+        sed -i -E "s/^Your time limit is [0-9]+ minutes;/Your time limit is $(( (secs + 30) / 60 )) minutes;/" \
+            "$dst/instruction.md"
         echo "$PWD/$dst"
     }
     for key in "${!groups[@]}"; do
@@ -553,7 +608,7 @@ run)
             p=$(variant "$ds/$task" "${dur:-$base_timeout}"); names+=("$task")
             for ((i = 0; i < remaining; i++)); do task_paths+=("$p"); done
         done < <(python3 skip_existing.py --jobs jobs --dataset "$ds" --agent "$agent" ${CC_VERSION:+--agent-version "$CC_VERSION"} \
-                    --budget "$BUDGET" --think-budget "$THINK_BUDGET" --max-dur "${dur:-$base_timeout}" --k "$want_k" --server "$srv_file" "${globs[@]}")
+                    --budget "$BUDGET" --think-budget "$THINK_BUDGET" --max-dur "${dur:-$base_timeout}" --max-dur-base "$base_dur" --k "$want_k" --server "$srv_file" "${globs[@]}")
         [ $skipped -gt 0 ] && echo "SKIP_EXISTING: skipped $skipped task(s) in $ds (listed above)" >&2
     done
     if [ ${#task_paths[@]} -eq 0 ]; then

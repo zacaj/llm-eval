@@ -24,12 +24,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+
+from job_settings import think_budget
 
 # Commands the agent ran, classified by intent. Matched against the shell
 # command string of Bash-like tool calls (claude-code `command`, terminus-2
@@ -49,6 +54,10 @@ FAIL_OUTPUT_RE = re.compile(
     r"\bFAILED\b|\bFAIL\b|Traceback \(most recent|error(\[E\d+\])?:|Error:|BUILD FAILED|"
     r"panic:|Segmentation fault|SyntaxError"
 )
+SHELL_TOOLS = {"Bash", "bash", "execute_bash", "run_command", "shell"}
+# a shell result that says the command itself was wrong, not that the program it ran failed
+BASH_USAGE_RE = re.compile(r"Exit code 12[67]\b|command not found|syntax error near|unexpected EOF|Permission denied|"
+                           r"No such file or directory|cannot (?:open|access|stat)\b|: not found\b")
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "str_replace_editor", "write_file", "edit_file"}
 # terminus-2 has no edit tool: it writes files with heredocs/redirects. Source
 # files only, so scratch output like `> /tmp/out.txt` isn't an edit.
@@ -70,10 +79,14 @@ COLUMNS = [
     "agent_sec", "agent_sec_adj", "slow_lost_sec", "verifier_sec", "total_sec",
     "in_tokens", "cached_tokens", "out_tokens",
     "agent_steps", "tool_calls", "tool_errors", "malformed_calls", "markup_final",
+    "recall_steps", "recall_first_step", "recall_content", "fetch_source_calls", "fetch_source_ok", "net_calls",
+    "instr_names_source",
     "thinking_blocks", "thinking_cutoffs", "thinking_cutoff_source", "final_turn_cutoff", "final_no_action",
+    "think_chars", "think_code_chars", "big_writes", "writes_from_think", "think_spills",
+    "loop_blocks", "loop_unrecovered",
     "px_requests", "px_rejected", "px_output_tokens", "px_reasoning_tokens", "px_answer_tokens",
     "px_budget_cutoffs", "px_effort", "px_reasoning_budget", "px_model_sec", "px_slow_requests",
-    "px_baseline_tok_s",
+    "px_baseline_tok_s", "px_max_tokens",
     "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
     "tools",
 ]
@@ -114,21 +127,85 @@ def result_failed(res: dict) -> bool:
     return bool(FAIL_OUTPUT_RE.search(content))
 
 
+# The model recognising the exercise and recalling the upstream solution/tests (it
+# nearly always names the source). 30 of 225 instructions name it too
+# (`~~~~exercism/note`, problem-specifications links): see instr_names_source.
+RECALL_RE = re.compile(r"exercism|problem[-_ ]specifications|canonical[-_ ]data", re.I)
+
+
+# recall_content: after the first mention, the model's own next RECALL_WINDOW chars
+# hold recalled material, either fenced code or a list of test cases. 2026-10-31
+# audit: 322 of 344 mentioning trials; the other 22 only name the exercise ("the
+# classic Exercism scale generator") or mention it in passing ("exercism lint runs in CI").
+RECALL_WINDOW = 8000
+FENCE_RE = re.compile(r"```.*?```", re.S)
+TEST_CASE_RE = re.compile(r"^\s*(?:[-*]|\d+\.)\s.*(?:→|->|=>|==|assert|test|expect|raises?)", re.M | re.I)
+# fetching the upstream exercise (the sandbox has network): curl the problem-specs or
+# track repo. _ok = the call came back with real content, not a 404 / no network
+FETCH_RE = re.compile(r"\b(?:curl|wget|git clone|urllib|requests\.get)", re.I)
+# net_calls: any fetch of an outside URL by the agent itself (package installs aren't
+# counted: they go through pip/npm/cargo/go, which these regexes don't match)
+NET_RE = re.compile(r"\b(?:curl\b|wget\b|git clone|urllib|requests\.(?:get|post)|http\.get|fetch\().*?https?://",
+                    re.I | re.S)
+NET_TOOLS = {"WebFetch", "WebSearch"}
+LOCAL_URL_RE = re.compile(r"https?://(?:localhost|127\.|0\.0\.0\.0|host\.docker\.internal)", re.I)
+RECALL_SITE_RE = re.compile(r"github|exercism", re.I)
+FETCH_FAIL_RE = re.compile(r"404|Could not resolve|timed out|Failed to connect", re.I)
+
+
+# A mention is skipped when its own sentence reads as a search ("let me look for the
+# exercism test files") unless that sentence also says it recalls. The Qwen3.6 models
+# (2026-11-01) name the source as somewhere to look and then write their own code; the
+# code-after-mention test alone flagged them.
+SEARCH_CTX_RE = re.compile(r"\b(?:look(?:ing)? (?:for|at|up)|search(?:ing)?|find(?:ing)?|check(?:ing)?|locate|"
+                           r"(?:don'?t|do not) have|no access|can'?t (?:see|access|find)|might be|downloaded)\b", re.I)
+RECALL_CTX_RE = re.compile(r"\b(?:recall|remember|from memory|i know|i'm familiar)\b", re.I)
+SENTENCE_END_RE = re.compile(r"[.!?]\s|\n")
+
+
+def mention_sentence(text: str, m: re.Match) -> str:
+    start = max((e.end() for e in SENTENCE_END_RE.finditer(text, max(0, m.start() - 300), m.start())), default=max(0, m.start() - 300))
+    end = SENTENCE_END_RE.search(text, m.end())
+    return text[start:end.start() if end else m.end() + 300]
+
+
+def recall_content(text: str) -> int:
+    for m in RECALL_RE.finditer(text):
+        sent = mention_sentence(text, m)
+        if SEARCH_CTX_RE.search(sent) and not RECALL_CTX_RE.search(sent):
+            continue
+        after = text[m.end():m.end() + RECALL_WINDOW]
+        if sum(map(len, FENCE_RE.findall(after))) >= 500 or len(TEST_CASE_RE.findall(after)) >= 4:
+            return 1
+    return 0
+
+
 def trajectory_stats(path: Path) -> dict:
     s = dict.fromkeys(
         ["agent_steps", "tool_calls", "tool_errors", "malformed_calls", "markup_final",
-         "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs"], 0)
+         "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
+         "recall_steps", "recall_content", "fetch_source_calls", "fetch_source_ok", "net_calls"], 0)
     s["tools"] = ""
+    s["recall_first_step"] = ""
     if not path.exists():
         return {k: "" for k in s}
     traj = json.loads(path.read_text())
     tools: dict[str, int] = {}
     last_agent_msg = ""
+    own_text: list[str] = []
     for step in traj.get("steps", []):
         if step.get("source") != "agent":
             continue
         s["agent_steps"] += 1
         last_agent_msg = text_of(step.get("message"))
+        # the model's own text only: tool results quote workspace files, which can
+        # name the source themselves
+        own = text_of(step.get("reasoning_content")) + "\n" + last_agent_msg
+        own_text.append(own)
+        if RECALL_RE.search(own):
+            s["recall_steps"] += 1
+            if s["recall_first_step"] == "":
+                s["recall_first_step"] = s["agent_steps"]
         results = {r.get("source_call_id"): r for r in ((step.get("observation") or {}).get("results") or [])}
         # results without call ids (some agents) pair up positionally
         unkeyed = [r for k, r in results.items() if k is None]
@@ -142,8 +219,12 @@ def trajectory_stats(path: Path) -> dict:
             tools[name] = tools.get(name, 0) + 1
             failed = bool(res) and result_failed(res)
             content = text_of(res.get("content")) if res else ""
-            if (res.get("extra") or {}).get("tool_result_is_error"):
-                s["tool_errors"] += 1
+            if (res.get("extra") or {}).get("tool_result_is_error") and "InputValidationError" not in content:
+                # not a failing command (test/build runs are counted on their own): other
+                # tools' errors, and shell-level misuse -- exit 126/127, bad syntax,
+                # missing file or permission
+                if name not in SHELL_TOOLS or BASH_USAGE_RE.search(content):
+                    s["tool_errors"] += 1
             if MARKUP_RE.search(text_of(args)) or "InputValidationError" in content:
                 s["malformed_calls"] += 1
             if name in EDIT_TOOLS:
@@ -154,6 +235,11 @@ def trajectory_stats(path: Path) -> dict:
                 extra = (res.get("extra") or {}) if res else {}
                 s["edit_errors"] += bool(extra.get("tool_result_is_error") or extra.get("is_error"))
             cmd = command_of(args)
+            if name in NET_TOOLS or NET_RE.search(cmd or text_of(args)) and not LOCAL_URL_RE.search(cmd or text_of(args)):
+                s["net_calls"] += 1
+            if FETCH_RE.search(cmd or text_of(args)) and RECALL_SITE_RE.search(cmd or text_of(args)):
+                s["fetch_source_calls"] += 1
+                s["fetch_source_ok"] += len(content) > 400 and not FETCH_FAIL_RE.search(content[:300])
             if cmd:
                 if name not in EDIT_TOOLS and SHELL_WRITE_RE.search(cmd):
                     s["edits"] += 1
@@ -164,6 +250,7 @@ def trajectory_stats(path: Path) -> dict:
                     s["build_runs"] += 1
                     s["build_fail_runs"] += failed
     s["markup_final"] = int(bool(MARKUP_RE.search(last_agent_msg)))
+    s["recall_content"] = recall_content("\n".join(own_text))
     s["tools"] = ",".join(f"{k}:{v}" for k, v in sorted(tools.items(), key=lambda kv: -kv[1]))
     return s
 
@@ -185,12 +272,45 @@ def looks_cut(text: str) -> bool:
     return len(t) >= THINK_CUT_EST_CHARS and not t.endswith(SENTENCE_END)
 
 
+FENCED = re.compile(r"```.*?(?:```|$)", re.S)
+# a Write/Edit at least this many (12+ char) lines long is a "big write"; it was copied
+# from thinking when this share of its lines already appeared, verbatim, in thinking
+BIG_WRITE_LINES = 10
+COPY_FRAC = 0.8
+# a loop: the same 3 consecutive prose lines (fenced code excluded, so rewriting a draft
+# doesn't count) 5+ times in one block. Unrecovered: the block ends inside it (half the
+# last 30 lines are lines seen 3+ times there), i.e. it repeated until a token cap
+LOOP_REPEATS = 5
+LOOP_TAIL = 30
+
+
+def sig_lines(text: str) -> list[str]:
+    return [l.strip() for l in text.splitlines() if len(l.strip()) >= 12]
+
+
+def loop_info(text: str) -> tuple[bool, bool]:
+    lines = sig_lines(FENCED.sub("", text))
+    if len(lines) < 3 * 3:
+        return False, False
+    shingles = Counter(tuple(lines[i:i + 3]) for i in range(len(lines) - 2))
+    tail = lines[-LOOP_TAIL:]
+    tc = Counter(tail)
+    stuck = sum(v for v in tc.values() if v >= 3) / len(tail) >= 0.5
+    return stuck or max(shingles.values()) >= LOOP_REPEATS, stuck
+
+
 def thinking_stats(agent_dir: Path) -> dict:
     """From Claude Code's stream-json log (agent/claude-code.txt): thinking blocks,
     how many were cut off by the reasoning budget, and whether the final turn was
     cut off and/or ended with no tool call (Claude Code treats that as "done", so a
-    model that stops after announcing its next step ends the episode)."""
+    model that stops after announcing its next step ends the episode).
+    Also reasoning style / degeneration: code written inside thinking (fenced chars),
+    big Write/Edit calls whose lines were already in earlier thinking (code drafted in
+    thinking, then copied out), thinking that spilled into the answer (a <think> tag in
+    text / tool input), and blocks that looped (and whether they ended still looping)."""
     keys = ["thinking_blocks", "thinking_cutoffs", "final_turn_cutoff", "final_no_action",
+            "think_chars", "think_code_chars", "big_writes", "writes_from_think", "think_spills",
+            "loop_blocks", "loop_unrecovered",
             "_cut_marker", "_cut_est", "_final_cut_est"]
     log = agent_dir / "claude-code.txt"
     if not log.exists():
@@ -208,11 +328,34 @@ def thinking_stats(agent_dir: Path) -> dict:
     s = dict.fromkeys(keys, 0)
     cut = lambda b: b.get("type") == "thinking" and b.get("thinking", "").rstrip().endswith(THINK_CUTOFF)
     est = lambda b: b.get("type") == "thinking" and not cut(b) and looks_cut(b.get("thinking", ""))
+    seen_think: set[str] = set()
     for blocks in turns.values():
         for b in blocks:
-            s["thinking_blocks"] += b.get("type") == "thinking"
-            s["_cut_marker"] += cut(b)
-            s["_cut_est"] += est(b)
+            ty = b.get("type")
+            body = b.get("thinking") if ty == "thinking" else b.get("text") if ty == "text" else None
+            if ty == "thinking":
+                s["thinking_blocks"] += 1
+                s["_cut_marker"] += cut(b)
+                s["_cut_est"] += est(b)
+                s["think_chars"] += len(body or "")
+                s["think_code_chars"] += sum(len(m) for m in FENCED.findall(body or ""))
+                seen_think.update(sig_lines(body or ""))
+            if body:
+                looped, stuck = loop_info(body)
+                s["loop_blocks"] += looped
+                s["loop_unrecovered"] += stuck
+            if ty == "text" and ("</think>" in (body or "") or "<think>" in (body or "")):
+                s["think_spills"] += 1
+            if ty == "tool_use":
+                inp = b.get("input") or {}
+                if any(isinstance(v, str) and ("</think>" in v or "<think>" in v) for v in inp.values()):
+                    s["think_spills"] += 1
+                if b.get("name") in ("Write", "Edit", "MultiEdit"):
+                    code = inp.get("content") or inp.get("new_string") or ""
+                    lines = sig_lines(code)
+                    if len(lines) >= BIG_WRITE_LINES:
+                        s["big_writes"] += 1
+                        s["writes_from_think"] += sum(l in seen_think for l in lines) / len(lines) >= COPY_FRAC
     # thinking_cutoffs / final_turn_cutoff are settled in main() (cutoff_source): marker
     # counts here, the proxy's count when it has one
     s["thinking_cutoffs"] = s["_cut_marker"]
@@ -334,7 +477,7 @@ def proxy_stats(tdir: Path, rows: list[dict]) -> dict:
     X-Eval-Session (starts with the trial name)."""
     keys = ["px_requests", "px_rejected", "px_output_tokens", "px_reasoning_tokens", "px_answer_tokens",
             "px_budget_cutoffs", "px_effort", "px_reasoning_budget", "px_model_sec", "px_slow_requests",
-            "px_baseline_tok_s", "slow_lost_sec"]
+            "px_baseline_tok_s", "slow_lost_sec", "px_max_tokens"]
     if not rows:
         return dict.fromkeys(keys, "")
     mine = trial_proxy_rows(tdir, rows)
@@ -350,6 +493,7 @@ def proxy_stats(tdir: Path, rows: list[dict]) -> dict:
         "px_effort": uniq("effort"),
         "px_reasoning_budget": uniq("reasoning_budget"),
         "px_model_sec": round(sum(num(r, "duration_ms") for r in done) / 1000),
+        "px_max_tokens": sum(r.get("stop_reason") == "max_tokens" for r in done),
         **slow_stats(done, job_baseline_tok_s(rows)),
     }
 
@@ -380,6 +524,15 @@ def task_agent_timeout(tdir: Path) -> float:
         return float(re.search(r"timeout_sec\s*=\s*([0-9.]+)", sect).group(1))
     except (OSError, KeyError, IndexError, AttributeError, ValueError):
         return 1800.0
+
+
+def instr_text(tdir: Path) -> str:
+    """The instruction.md of the task the trial ran."""
+    try:
+        cfg = json.loads((tdir / "config.json").read_text())
+        return (Path(cfg["task"]["path"]) / "instruction.md").read_text()
+    except (OSError, KeyError, ValueError):
+        return ""
 
 
 EXPECTED_TOTALS = Path(__file__).parent / "expected-totals.tsv"
@@ -489,6 +642,15 @@ def main() -> None:
         if (f.parent / "server-settings-after.txt").exists():
             kv["srv.changed_during_run"] = "yes"
         job_srv[f.parent.name] = kv
+    # the thinking cap as skip_existing.py sees it: newer jobs keep THINK_BUDGET in
+    # run-settings.txt (llama's capture doesn't record it), so the viz groups on the same value
+    for d in a.jobs_dir.iterdir():
+        kv = job_srv.setdefault(d.name, {}) if d.is_dir() else None
+        if kv is not None and not kv.get("srv.eff.reasoning_budget"):
+            tb = think_budget(d, kv)
+            if tb:
+                kv["srv.eff.reasoning_budget"] = tb
+                kv["srv.eff.reasoning_budget_source"] = "run-settings"
 
     # keyed by "polyglot_<lang>_<exercise>": task names differ by dataset (classic
     # "aider-ai/aider-polyglot__polyglot_rust_forth", test-calls "polyglot_rust_forth__tc4")
@@ -514,6 +676,8 @@ def main() -> None:
         mi = d["agent_info"].get("model_info") or {}
         task = d["task_name"]
         m = re.search(r"polyglot_([a-z]+)_(.+?)(?:__tc\d+)?$", task)
+        # other datasets (terminal-bench/<task>[__tc<N>]): language = dataset tag
+        m_tb = None if m else re.match(r"terminal-bench/(.+?)(?:__tc\d+)?$", task)
         o_total = oracle_total.get(exercise_key(task))
         rescored = rescore(tdir, m.group(1) if m else "", rw, o_total)
         if rescored:
@@ -533,9 +697,10 @@ def main() -> None:
             "agent": d["agent_info"]["name"],
             "agent_version": d["agent_info"].get("version", ""),
             "model": mi.get("name", ""),
-            "task": task.split("__", 1)[-1],  # drop "<dataset>__"; tc tasks keep their "__tc<N>"
-            "language": m.group(1) if m else "",
-            "exercise": m.group(2) if m else "",
+            # drop polyglot's "<dataset>__" / other datasets' "<org>/"; tc tasks keep their "__tc<N>"
+            "task": task.split("__", 1)[-1] if m else task.rsplit("/", 1)[-1],
+            "language": m.group(1) if m else ("tb2" if m_tb else ""),
+            "exercise": m.group(2) if m else (m_tb.group(1) if m_tb else ""),
             "trial": tdir.name,
             # <trial>/INVALID (first line = reason): trial ran under a known harness bug;
             # keep the row for the record but exclude it from comparisons
@@ -560,6 +725,7 @@ def main() -> None:
         }
         row.update(trajectory_stats(tdir / "agent" / "trajectory.json"))
         row.update(thinking_stats(tdir / "agent"))
+        row["instr_names_source"] = int(bool(RECALL_RE.search(instr_text(tdir))))
         if tdir.parent.name not in px_cache:
             px_cache[tdir.parent.name] = proxy_rows(tdir.parent)
         row.update(proxy_stats(tdir, px_cache[tdir.parent.name]))
@@ -645,6 +811,14 @@ def main() -> None:
                 w.writerow({**{k: r[k] for k in PROGRESS_COLUMNS[:7]}, **p})
                 n += 1
     print(f"{n} progress points -> {prog_out}")
+    # rebuild the viz whenever the TSVs change (run.sh's refresh_viz does the same after
+    # aider runs); VIZ_REFRESH=0 skips it. A failed rebuild is a warning, not a collect failure.
+    gen = a.out.parent / "generate_viz_data.py"
+    if os.environ.get("VIZ_REFRESH", "1") != "0" and gen.exists():
+        r = subprocess.run([sys.executable, gen.name], cwd=a.out.parent,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode:
+            print(f"WARNING: viz refresh failed (run {gen.name} in {a.out.parent} to see why)", file=sys.stderr)
 
 
 if __name__ == "__main__":

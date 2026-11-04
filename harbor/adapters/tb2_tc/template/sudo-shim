@@ -1,0 +1,11 @@
+#!/bin/bash
+# (tb2_tc) /usr/local/bin/sudo: `sudo apt-get ...` / `sudo apt ...` go to the apt shim
+# (which uses the allowed wrapper); anything else is the real sudo, non-interactive so
+# a disallowed command fails at once instead of waiting for a password.
+args=("$@")
+while [ ${#args[@]} -gt 0 ] && [[ "${args[0]}" == -* ]]; do args=("${args[@]:1}"); done
+case "${args[0]:-}" in
+    apt-get|apt|/usr/bin/apt-get|/usr/bin/apt)
+        exec "/usr/local/bin/$(basename "${args[0]}")" "${args[@]:1}" ;;
+esac
+exec /usr/bin/sudo -n "$@"

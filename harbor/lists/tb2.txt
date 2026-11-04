@@ -1,0 +1,13 @@
+# Terminal-Bench 2 pilot set (harbor/tasks/tb2, test-calls variants in tasks/tb2_tc).
+# Format matches the other lists: <task>  [test_calls]  [max_dur_sec]
+# max_dur = the task's own agent timeout from its task.toml.
+# Mixable with polyglot rows in one list (harbor.sh run --list); calls -> tasks/tb2_tc/<task>__tc<N>
+# (missing ones are generated when TB2_SRC=<terminal-bench-2 checkout> is set).
+#
+# task                          calls  max_dur
+cobol-modernization             5      900
+constraints-scheduling          5      1200
+financial-document-processor    5      1200
+custom-memory-heap-crash        5      1800
+multi-source-data-merger        5      900
+db-wal-recovery                 5      900

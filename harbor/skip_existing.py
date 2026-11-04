@@ -20,18 +20,24 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from job_settings import dur_scale, think_budget
+
 # Output-affecting server settings that must match (others, e.g. speculative
 # decoding knobs, change speed not outputs). Missing on both sides = match.
 SERVER_KEYS = re.compile(
     r"^srv\.(target|-m|--temp|--top-p|--top-k|--min-p|eff\..*|kv_cache|-ctk|-ctv|"
     r"--reasoning-budget|logit_bias|proxy_filters|--chat-template-file)$"
 )
+# the thinking cap is compared on its own (job_settings.think_budget, which collect.py /
+# the viz use too): newer jobs record it in run-settings.txt, not the server capture
+SERVER_SKIP = {"srv.eff.reasoning_budget"}
 
 
 def server_sig(text: str) -> dict[str, str]:
     kv = dict(l.split("=", 1) for l in text.splitlines() if "=" in l)
     # *_source keys say where a value came from (e.g. "backfilled"), not what ran
-    return {k: v for k, v in kv.items() if SERVER_KEYS.match(k) and not k.endswith("_source")}
+    return {k: v for k, v in kv.items() if SERVER_KEYS.match(k) and not k.endswith("_source")
+            and k not in SERVER_SKIP}
 
 
 def task_timeout(task_dir: Path) -> float:
@@ -51,12 +57,13 @@ def agent_seconds(r: dict) -> float | None:
         return None
 
 
-def time_limit_matches(r: dict, limit: int, want_limit: int) -> bool:
-    """A trial that hit its time limit was graded on a snapshot taken at that limit,
-    so it only matches the same limit. One that ended on its own (done, budget or
-    test-call stop, ...) after T seconds would have played out identically under
-    any limit >= T, whatever limit it actually ran with."""
-    if limit == want_limit:
+def time_limit_matches(r: dict, limit: int, want_limit: int, base: int, want_base: int | None) -> bool:
+    """Same configured (unscaled) limit = same run: MAX_DUR_SCALE=auto only adjusts it for
+    the server's measured speed, which drifts a little between jobs. Otherwise, a trial
+    that hit its time limit was graded on a snapshot taken at that limit, so it doesn't
+    match. One that ended on its own (done, budget or test-call stop, ...) after T seconds
+    would have played out identically under any limit >= T, whatever it ran with."""
+    if limit == want_limit or (want_base is not None and base == want_base):
         return True
     if ((r.get("exception_info") or {}).get("exception_type")) == "AgentTimeoutError":
         return False
@@ -73,12 +80,16 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=0)
     ap.add_argument("--think-budget", type=int, default=0)
     ap.add_argument("--max-dur", default="")
+    ap.add_argument("--max-dur-base", default="", help="the limit before MAX_DUR_SCALE")
     ap.add_argument("--k", type=int, default=1)
     ap.add_argument("--server", type=Path, required=True)
     ap.add_argument("globs", nargs="+")
     a = ap.parse_args()
 
+    want_srv_all = dict(l.split("=", 1) for l in a.server.read_text().splitlines() if "=" in l)
     want_srv = server_sig(a.server.read_text())
+    want_think = str(a.think_budget) if a.think_budget else want_srv_all.get("srv.eff.reasoning_budget", "")
+    want_base = round(float(a.max_dur_base)) if a.max_dur_base else None
     tasks = sorted(p.name for p in a.dataset.iterdir()
                    if p.is_dir() and any(fnmatch.fnmatch(p.name, g) for g in a.globs))
 
@@ -96,12 +107,9 @@ def main() -> None:
         m = re.search(r"X-Eval-Budget\W+(\d+)", cj)
         if (int(m.group(1)) if m else 0) != a.budget:
             continue
-        # thinking cap (run-settings.txt think_budget, written by harbor.sh); jobs from before
-        # it was set ran at Strata's default cap, so they never match a set budget
-        rs = job / "run-settings.txt"
-        tb = re.search(r"^think_budget=(\d+)$", rs.read_text(), re.M) if rs.exists() else None
-        if ((int(tb.group(1)) or None) if tb else None) != (a.think_budget or None):
+        if think_budget(job) != want_think:
             continue
+        scale = dur_scale(job)
         mult = cfg.get("agent_timeout_multiplier") or cfg.get("timeout_multiplier") or 1.0
         for res in job.glob("*/result.json"):
             tdir = res.parent
@@ -122,7 +130,7 @@ def main() -> None:
             src = task_path if (task_path / "task.toml").exists() else a.dataset / task
             limit = round(task_timeout(src) * mult)
             want_limit = round(float(a.max_dur)) if a.max_dur else round(task_timeout(a.dataset / task))
-            if time_limit_matches(r, limit, want_limit):
+            if time_limit_matches(r, limit, want_limit, round(limit / scale), want_base):
                 have[task] += 1
                 where[task][job.name] = where[task].get(job.name, 0) + 1
 

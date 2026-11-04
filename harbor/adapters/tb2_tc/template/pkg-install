@@ -1,0 +1,32 @@
+#!/bin/bash
+# (tb2_tc) The non-root agent's only root operation besides run-tests: install
+# packages from the image's configured distro repos. Plain package names
+# (optionally =version) only -- no apt options (-o hooks run arbitrary commands)
+# and no paths (a local .deb's maintainer scripts run as root).
+#   pkg-install --update | --enable-src | <pkg>[=<version>]...
+# --enable-src turns on the deb-src entries (and dpkg-dev) so the agent can run
+# `apt-get source` / `apt-get download` itself, unprivileged.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+if [ "${1:-}" = --update ]; then exec apt-get update; fi
+if [ "${1:-}" = --enable-src ]; then
+    [ -f /var/lib/run-tests/.src-enabled ] && exit 0
+    for f in /etc/apt/sources.list.d/*.sources; do
+        [ -f "$f" ] && sed -i -E 's/^Types: deb$/Types: deb deb-src/' "$f"
+    done
+    if [ -f /etc/apt/sources.list ]; then
+        sed -n -E 's/^deb (.*)$/deb-src \1/p' /etc/apt/sources.list > /etc/apt/sources.list.d/tb-src.list
+    fi
+    apt-get update
+    command -v dpkg-source >/dev/null || apt-get install -y dpkg-dev
+    touch /var/lib/run-tests/.src-enabled
+    exit 0
+fi
+[ $# -gt 0 ] || { echo "usage: apt-get install <package>..." >&2; exit 2; }
+for p in "$@"; do
+    [[ "$p" =~ ^[a-z0-9][a-z0-9.+-]*(=[A-Za-z0-9.:~+-]+)?$ ]] \
+        || { echo "refusing package argument: $p (plain package names only)" >&2; exit 2; }
+done
+# lists are usually emptied in images; fetch them once
+compgen -G '/var/lib/apt/lists/*_Packages' >/dev/null || apt-get update
+exec apt-get install -y "$@"

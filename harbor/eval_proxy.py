@@ -135,7 +135,14 @@ class Handler(BaseHTTPRequestHandler):
                 # Claude Code sends thinking "adaptive", which Strata caps at its default 4000;
                 # an explicit budget is honored, so set it here (EFFORT picks the size in harbor.sh)
                 data["thinking"] = {"type": "enabled", "budget_tokens": args.think_budget}
+                # the Strata prompt-logger's cap_reasoning_budget filter only treats the flat
+                # field as explicit; without it the filter's default (8000) overrides the above
+                data["reasoning_budget_tokens"] = args.think_budget
                 data["max_tokens"] = args.think_budget + args.answer_tokens
+                body = json.dumps(data).encode()
+            elif args.think_budget < 0 and path == "/v1/messages" and isinstance(data, dict):
+                # EFFORT=off (harbor.sh passes -1): reasoning disabled, max_tokens left as sent
+                data["thinking"] = {"type": "disabled"}
                 body = json.dumps(data).encode()
             try:
                 budget = int(self.headers.get("X-Eval-Budget") or 0)
@@ -248,7 +255,8 @@ def main():
     ap.add_argument("--model", default="", help="rewrite each request's model field to this server id")
     ap.add_argument("--timeout", type=float, default=3600)
     ap.add_argument("--think-budget", type=int, default=0,
-                    help="set thinking to enabled/budget_tokens=N on /v1/messages (0 = leave the request alone)")
+                    help="set thinking to enabled/budget_tokens=N on /v1/messages (0 = leave the request alone, "
+                         "-1 = thinking disabled)")
     ap.add_argument("--answer-tokens", type=int, default=8000,
                     help="with --think-budget: max_tokens = think budget + this (answer/tool-call headroom)")
     args = ap.parse_args()

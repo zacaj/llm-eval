@@ -1,0 +1,24 @@
+#!/bin/bash
+# (tb2_tc) Installed as /usr/local/bin/apt-get and /usr/local/bin/apt (ahead of
+# /usr/bin on PATH): the agent isn't root, so `apt-get update` / `apt-get install ...`
+# go through the sudo-allowed pkg-install wrapper. Root (oracle, verifier) gets the
+# real command.
+name=$(basename "$0")
+[ "$(id -u)" = 0 ] && exec "/usr/bin/$name" "$@"
+action=""; pkgs=()
+for a in "$@"; do
+    case "$a" in
+        -*) ;;   # -y, -q, --no-install-recommends, ...: pkg-install always uses -y
+        *) if [ -z "$action" ]; then action="$a"; else pkgs+=("$a"); fi ;;
+    esac
+done
+case "$action" in
+    update) exec /usr/bin/sudo -n /usr/local/sbin/pkg-install --update ;;
+    install) exec /usr/bin/sudo -n /usr/local/sbin/pkg-install "${pkgs[@]}" ;;
+    # unprivileged once deb-src is on: runs as the agent, into the current dir
+    source|download)
+        /usr/bin/sudo -n /usr/local/sbin/pkg-install --enable-src >/dev/null || exit 100
+        exec "/usr/bin/apt-get" "$@" ;;
+    *) echo "$name: you are not root here; only '$name update', '$name install <packages>', '$name source <package>' and '$name download <package>' are available" >&2
+       exit 100 ;;
+esac

@@ -76,6 +76,7 @@ def sample(trial_dir: Path, cid: str, image: str, t0: float, a) -> None:
             name = f"progress-{trial_dir.name.lower()}-{int(start)}"
             try:
                 subprocess.run(["docker", "run", "--rm", "--name", name, f"--cpus={a.cpus}",
+                                f"--memory={a.memory}", f"--memory-swap={a.memory}", "--pids-limit=1024",
                                 "-e", f"TEST_TIMEOUT={a.timeout}",
                                 "-v", f"{snap}:/app", "-v", f"{tests}:/tests:ro", "-v", f"{out}:/logs/verifier",
                                 "--entrypoint", "bash", image, "/tests/test.sh"],
@@ -111,6 +112,7 @@ def main() -> None:
     p.add_argument("--interval", type=int, default=180, help="seconds between samples of a trial")
     p.add_argument("--timeout", type=int, default=90, help="test run cap (TEST_TIMEOUT) per sample")
     p.add_argument("--cpus", default="2")
+    p.add_argument("--memory", default="4g")  # same cap as the trial containers (task.toml memory_mb)
     a = p.parse_args()
     last: dict[str, float] = {}       # trial -> time its last sample started
     busy: dict[str, threading.Thread] = {}

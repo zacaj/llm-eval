@@ -6,11 +6,14 @@ go	simple-linked-list	14
 go	tree-building	17
 java	ledger	11
 java	satellite	6
+javascript	scale-generator	19
 javascript	triangle	19
+javascript	zebra-puzzle	2
 javascript	zipper	19
 python	beer-song	8
 python	bowling	31
 python	paasio	25
+python	pov	15
 python	sgf-parsing	23
 rust	forth	50
 rust	poker	37

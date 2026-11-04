@@ -17,7 +17,20 @@ network_mode = "public"
 timeout_sec = 1800.0
 
 [agent]
-network_mode = "public"
+# (fork) agents curl'd the upstream exercise repo for the reference solution and
+# hidden tests (2026-10-31: 23 trials). Allowlist: the eval proxy on this host (LAN /
+# docker bridge) and the toolchains' package registries; github / exercism stay
+# blocked (go modules come via proxy.golang.org). The verifier stays public: the
+# agent's processes are gone by then and test builds may fetch dependencies.
+network_mode = "allowlist"
+allowed_hosts = [
+  "192.168.0.0/16", "172.16.0.0/12",
+  "pypi.org", "files.pythonhosted.org",
+  "registry.npmjs.org",
+  "crates.io", "index.crates.io", "static.crates.io",
+  "proxy.golang.org", "sum.golang.org",
+  "repo.maven.apache.org", "repo1.maven.org", "plugins.gradle.org", "services.gradle.org", "downloads.gradle.org",
+]
 timeout_sec = 1800.0
 
 [environment]
