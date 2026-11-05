@@ -126,7 +126,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req, timeout=120))))
   python3 -I -c '
 import json, sys
 d = json.loads(sys.argv[1])
-eff = d.get("strata_effective") or {}
+eff = d.get("strata_effective") or d.get("llama_effective") or {}
 # engine = what the sampler really uses (clamped/validated, unknown keys dropped);
 # sampling is only the request echo + defaults. Older servers have no engine section.
 samp = eff.get("engine") or eff.get("sampling") or {}
@@ -137,6 +137,10 @@ for src, dst in (("temperature", "temp"), ("top_p", "top_p"), ("top_k", "top_k")
     if samp.get(src) is not None: print(f"srv.eff.{dst}={samp[src]}")
     if src in want and samp.get(src) != want[src]:
         print(f"WARNING: EXTRA_BODY {src}={want[src]} but server reports {samp.get(src)} -- knob ignored or clamped", file=sys.stderr)
+# llama_effective only: the penalties and context window (Strata reports neither)
+for k in ("repetition_penalty", "frequency_penalty", "presence_penalty", "penalty_last_n"):
+    if d.get("llama_effective") and samp.get(k) is not None: print(f"srv.eff.{k}={samp[k]}")
+if d.get("llama_effective") and eff.get("context") is not None: print("srv.eff.context=" + str(eff["context"]))
 ' "$resp" "$EXTRA_BODY" || true
 }
 
@@ -153,6 +157,24 @@ strata_settings_effective() {
   eff="$(probe_strata_effective)"
   if [[ -z "$eff" ]]; then
     printf '%s\n' "$base" | apply_extra_body_overrides
+    return
+  fi
+  { printf '%s\n' "$base" | grep -v -E '^srv\.--(top-p|top-k|min-p)='
+    sed -n -E 's/^srv\.eff\.top_p=/srv.--top-p=/p; s/^srv\.eff\.top_k=/srv.--top-k=/p; s/^srv\.eff\.min_p=/srv.--min-p=/p' <<< "$eff"
+    printf '%s\n' "$eff"
+  } | grep -v '^$'
+}
+
+# llama.cpp: docker-inspect flags + the probe's llama_effective values, merged the
+# same way as strata_settings_effective (probe wins for top-p/top-k/min-p; the
+# srv.eff.* lines are kept too). Falls back to the flags alone if the probe says nothing.
+# Args: server container name.
+llama_settings_effective() {
+  local base eff
+  base="$(capture_srv_settings "$1")"
+  eff="$(probe_strata_effective)"
+  if [[ -z "$eff" ]]; then
+    printf '%s\n' "$base"
     return
   fi
   { printf '%s\n' "$base" | grep -v -E '^srv\.--(top-p|top-k|min-p)='
@@ -262,10 +284,16 @@ hdrs = {"Content-Type": "application/json", "anthropic-version": "2023-06-01", "
 for h in sys.argv[3:]:
     k, _, v = h.partition(":"); hdrs[k.strip()] = v.strip()
 req = urllib.request.Request(base + "/v1/messages", json.dumps(body).encode(), hdrs)
-eff = json.load(urllib.request.urlopen(req, timeout=300)).get("strata_effective") or {}
+resp = json.load(urllib.request.urlopen(req, timeout=300))
+# Strata: strata_effective (budget = reasoning_budget_requested, plus where it came from);
+# llama: llama_effective (reasoning_budget is the budget in effect, no source)
+eff = resp.get("strata_effective") or resp.get("llama_effective") or {}
+if "reasoning_budget" in eff and "reasoning_budget_requested" not in eff:
+    eff["reasoning_budget_requested"] = eff["reasoning_budget"]
 for src, dst in (("reasoning_effort", "reasoning_effort"),
                  ("reasoning_budget_requested", "reasoning_budget"),
-                 ("reasoning_budget_source", "reasoning_budget_source")):
+                 ("reasoning_budget_source", "reasoning_budget_source"),
+                 ("thinking", "thinking")):
     if eff.get(src) is not None: print(f"srv.eff.{dst}={eff[src]}")
 ' "$base" "$fields" "$@" 2>/dev/null || true
 }

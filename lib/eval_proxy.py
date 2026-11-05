@@ -63,7 +63,7 @@ def session_key(headers, data) -> str:
 
 
 class Stats:
-    """Pulls usage / strata_effective out of a (streamed or whole) response."""
+    """Pulls usage / strata_effective (or llama_effective) out of a (streamed or whole) response."""
 
     def __init__(self):
         self.out = 0
@@ -84,6 +84,11 @@ class Stats:
                 self.stop = ch["finish_reason"]
         if isinstance(d.get("strata_effective"), dict):
             self.eff = d["strata_effective"]
+        elif isinstance(d.get("llama_effective"), dict):
+            # llama.cpp's equivalent: same keys except the budget in effect is "reasoning_budget"
+            self.eff = dict(d["llama_effective"])
+            if "reasoning_budget" in self.eff:
+                self.eff["reasoning_budget_requested"] = self.eff["reasoning_budget"]
 
     def feed_sse(self, chunk: bytes):
         self.buf += chunk
@@ -91,7 +96,7 @@ class Stats:
         for line in lines:
             line = line.strip()
             # only the events that can carry usage / strata_effective, not every token delta
-            if line.startswith(b"data:") and (b"usage" in line or b"strata_effective" in line
+            if line.startswith(b"data:") and (b"usage" in line or b"strata_effective" in line or b"llama_effective" in line
                                                or b"finish_reason\": \"" in line or b"stop_reason" in line):
                 try:
                     self.feed_json(json.loads(line[5:]))

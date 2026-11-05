@@ -880,7 +880,7 @@ run_benchmark_and_track() {
       strata_settings_effective > "$srv_file"
     else
       container="$(detect_llama_container)"
-      capture_srv_settings "$container" > "$srv_file"
+      llama_settings_effective "$container" > "$srv_file"
     fi
     # The server flag is only the fallback; the per-request budget is what the
     # model actually ran under, so record that in the same column. Keeps one
@@ -1626,7 +1626,7 @@ case "$CMD" in
       if [[ "$TARGET" == "strata" ]]; then
         _srv_settings="$(strata_settings_effective)"
       else
-        _srv_settings="$(capture_srv_settings "$(detect_llama_container)")"
+        _srv_settings="$(llama_settings_effective "$(detect_llama_container)")"
       fi
       _srv_get() { sed -n "s/^$1=//p" <<< "$_srv_settings" | head -1; }
       CUR_SRV_TEMP="$(_srv_get srv.--temp)"

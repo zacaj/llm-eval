@@ -255,7 +255,15 @@ capture_server() (
         fi
     else
         echo "srv.target=llama"
-        capture_srv_settings "$(detect_llama_container)"
+        llama_settings_effective "$(detect_llama_container)"
+        # thinking settings as the proxy/Claude Code request resolves them (llama_effective)
+        if [ "${agent:-}" = claude-code ]; then
+            probe_body="{\"output_config\": {\"effort\": \"$EFFORT\"}, \"thinking\": {\"type\": \"adaptive\"}}"
+            [ "$THINK_BUDGET" -gt 0 ] && probe_body="{\"output_config\": {\"effort\": \"$EFFORT\"}, \"thinking\": {\"type\": \"enabled\", \"budget_tokens\": $THINK_BUDGET}, \"reasoning_budget_tokens\": $THINK_BUDGET}"
+            [ "$EFFORT" = off ] && probe_body='{"thinking": {"type": "disabled"}}'
+            probe_strata_reasoning "$BASE_URL" "$probe_body" \
+                "X-Eval-Budget: 1000" $([ "$PROXY_FILTERS" = 0 ] && echo "X-Eval-Filters:0")
+        fi
     fi
     echo "srv.proxy_filters=$PROXY_FILTERS"
 )
@@ -387,6 +395,7 @@ run)
                 echo "SWAP_CMD: no earlier job recorded for this command; swapping" >&2
             fi
         fi
+        echo "SWAP_CMD running: $SWAP_CMD" >&2
         eval "$SWAP_CMD" || { echo "SWAP_CMD failed" >&2; exit 1; }
     fi
 
