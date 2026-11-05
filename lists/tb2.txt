@@ -11,3 +11,6 @@ financial-document-processor    5      1200
 custom-memory-heap-crash        5      1800
 multi-source-data-merger        5      900
 db-wal-recovery                 5      900
+cancel-async-tasks              5      900    # hard: asyncio concurrency + KeyboardInterrupt cancellation
+headless-terminal               5      900    # pty-backed interactive terminal driver (system-python task)
+fix-code-vulnerability          5      900    # hard: find/fix a CWE in Bottle; also gated on Bottle's own suite (counted as 1 test)

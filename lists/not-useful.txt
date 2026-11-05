@@ -1,0 +1,22 @@
+# Exercises/tasks judged not useful for ranking models, with why. Still a valid list
+# (harbor.sh run --list / run.sh fromfile) for rechecking a judgement later.
+# Tags, for grouping/filtering (grep '\[recalled\]' etc.):
+#   [recalled]   the model knows the exercise; passes mostly come from memory
+#   [saturated]  (nearly) every model passes, so pass/fail can't rank
+#   [no-spread]  effort stats (requests/tokens to pass, test calls) barely differ between models
+#   [noisy]      effort stats vary a lot, but as much within a model as between models
+#
+# Effort-stat judgements (TB2) come from 1101-1104 harbor runs (5 models x 2-3 attempts):
+# between-model share of variance in requests/tokens to first pass, near 0 = noise.
+
+# --- polyglot (from 27b-diff-list.txt) ---
+go             simple-linked-list        4  400   # [recalled] [saturated] 69/71 graded harbor passes, all recall-flagged
+python         sgf-parsing               5  1100  # [recalled] passes are nearly all recalls (52 recall-flagged), failures are not
+go             bowling                   6  1200  # [recalled] 47 of 59 graded harbor passes, 52 trials recall-flagged
+python         pov                       5  500   # [recalled] [saturated] 59/64 graded harbor passes, all recall-flagged
+
+# --- Terminal-Bench 2 (lists/tb2.txt) ---
+constraints-scheduling          5      1200   # [saturated] [no-spread] all pass on run-tests call 1, 4-7 requests for every model
+multi-source-data-merger        5      900    # [saturated] [no-spread] all pass, 6-11 requests; no model signal
+db-wal-recovery                 5      900    # [saturated] [noisy] 5k-48k tokens to pass, but same model ranges 5k-40k
+financial-document-processor    5      1200   # [saturated] [no-spread] all pass first call; weak token signal at best
