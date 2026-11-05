@@ -65,6 +65,37 @@ SHELL_WRITE_RE = re.compile(
     r"(cat|tee)\b[^\n|]*?>{1,2}\s*['\"]?(?!/tmp/)[\w./-]+\.(py|go|rs|js|mjs|java|cpp|cc|h|hpp)\b"
     r"|\b(sed -i|perl -pi)\b"
 )
+# "Own tests": the agent wrote its own test / check script (or test block) beyond what the task
+# gave it. A created code file counts when its toolchain runs it (go/pytest/cargo/jest/junit pick
+# it up by name or content), or when it has a check-like name AND a later command executed it by
+# name. The name rule keeps the agent's own solution program (TB2's merge.py) out.
+CODE_EXT_RE = re.compile(r"\.(py|go|rs|js|mjs|cjs|ts|java|cpp|cc|c|h|hpp|cbl|cob|sh|rb)$")
+IMPLICIT_TEST_PATH_RE = re.compile(r"(_test\.go|(^|/)test_[^/]*\.py|_test\.py|\.(test|spec)\.[cm]?[jt]s|Tests?\.java|(^|/)tests?/)")
+IMPLICIT_TEST_BODY_RE = re.compile(r"#\[cfg\(test\)\]|#\[test\]|func Test\w+\(t \*testing\.T\)|\bdef test_\w+|\b(describe|it|test)\(['\"`]|@Test\b")
+TESTISH_NAME_RE = re.compile(r"(check|verify|verif|sanity|probe|debug|dbg|scratch|smoke|manual|harness|selfcheck|diag|repro|trial|demo|test|spec|assert|validate|compare|truth)", re.I)
+EXEC_RE = re.compile(r"\b(python3?|node|deno|bun|npx|go (run|test|vet)|cargo|rustc|java|javac|gcc|g\+\+|clang\+*|cc|cobc|bash|sh|pytest|ruby|make|ctest)\b|(^|[\s;&|])\./")
+HEREDOC_FILE_RE = re.compile(r"(?:cat|tee)\b[^\n|<]*?>{1,2}\s*['\"]?([\w./~-]+)")
+
+
+def expected_files(tdir: Path) -> set[str]:
+    """Basenames the task itself provides or asks for (starter workspace, files named /app/<x> in
+    the instruction, files the reference solve.sh writes): not "own tests" when an agent writes them."""
+    out: set[str] = set()
+    try:
+        task = Path(json.loads((tdir / "config.json").read_text())["task"]["path"])
+    except (OSError, KeyError, ValueError):
+        return out
+    ws = task / "environment" / "workspace"
+    if ws.is_dir():
+        out |= {f.name for f in ws.rglob("*") if f.is_file()}
+    for f, rx in (("instruction.md", re.compile(r"/app/([\w./-]+)")), ("solution/solve.sh", HEREDOC_FILE_RE)):
+        try:
+            out |= {m.rsplit("/", 1)[-1] for m in rx.findall((task / f).read_text())}
+        except OSError:
+            pass
+    return out
+
+
 # Harness-side "your reply didn't parse" feedback (terminus-2 JSON/XML parser);
 # the step has no tool calls, the complaint is in its observation.
 PARSE_ERROR_RE = re.compile(r"No valid JSON object found|Please fix these issues|No valid XML")
@@ -75,7 +106,8 @@ COLUMNS = [
     "tests_frac_adj", "tests_parsed",
     "test_limit", "test_calls", "test_limit_hit", "first_pass_call",
     "prog_samples", "prog_first_pass_sec", "prog_best_frac", "prog_last_frac",
-    "first_pass_requests", "first_pass_out_tokens", "exception",
+    "first_pass_requests", "first_pass_out_tokens", "post_pass_requests", "post_pass_out_tokens", "post_pass_frac",
+    "exception",
     "agent_sec", "agent_sec_adj", "slow_lost_sec", "verifier_sec", "total_sec",
     "in_tokens", "cached_tokens", "out_tokens",
     "agent_steps", "tool_calls", "tool_errors", "malformed_calls", "markup_final",
@@ -88,7 +120,7 @@ COLUMNS = [
     "px_budget_cutoffs", "px_effort", "px_reasoning_budget", "px_model_sec", "px_slow_requests",
     "px_baseline_tok_s", "px_max_tokens",
     "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
-    "tools",
+    "own_tests", "own_test_files", "tools",
 ]
 
 
@@ -180,12 +212,14 @@ def recall_content(text: str) -> int:
     return 0
 
 
-def trajectory_stats(path: Path) -> dict:
+def trajectory_stats(path: Path, expected: frozenset = frozenset()) -> dict:
     s = dict.fromkeys(
         ["agent_steps", "tool_calls", "tool_errors", "malformed_calls", "markup_final",
          "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
-         "recall_steps", "recall_content", "fetch_source_calls", "fetch_source_ok", "net_calls"], 0)
+         "recall_steps", "recall_content", "fetch_source_calls", "fetch_source_ok", "net_calls",
+         "own_tests"], 0)
     s["tools"] = ""
+    s["own_test_files"] = ""
     s["recall_first_step"] = ""
     if not path.exists():
         return {k: "" for k in s}
@@ -193,6 +227,10 @@ def trajectory_stats(path: Path) -> dict:
     tools: dict[str, int] = {}
     last_agent_msg = ""
     own_text: list[str] = []
+    seen: set[str] = set()                 # paths the agent has read or edited: already existed
+    created: dict[str, bool] = {}          # created code file -> implicitly run by its toolchain
+    ran: set[str] = set()                  # created files a later command named
+    impl_blocks = 0                        # test blocks added to a file the task gave (#[cfg(test)])
     for step in traj.get("steps", []):
         if step.get("source") != "agent":
             continue
@@ -235,6 +273,30 @@ def trajectory_stats(path: Path) -> dict:
                 extra = (res.get("extra") or {}) if res else {}
                 s["edit_errors"] += bool(extra.get("tool_result_is_error") or extra.get("is_error"))
             cmd = command_of(args)
+            fpath = str(args.get("file_path") or args.get("path") or "")
+            base = fpath.rsplit("/", 1)[-1]
+            body = text_of(args.get("content") or args.get("new_string") or "")
+            if name == "Read" or (name in EDIT_TOOLS and name != "Write" and fpath):
+                seen.add(fpath)
+            if name == "Write" and fpath and CODE_EXT_RE.search(base):
+                if fpath not in seen and base not in expected:
+                    created[fpath] = bool(IMPLICIT_TEST_PATH_RE.search(fpath) or IMPLICIT_TEST_BODY_RE.search(body))
+                elif base in expected and IMPLICIT_TEST_BODY_RE.search(body) and re.search(r"#\[cfg\(test\)\]|#\[test\]", body):
+                    impl_blocks += 1
+                seen.add(fpath)
+            elif name in EDIT_TOOLS and name != "Write" and base in expected and re.search(r"#\[cfg\(test\)\]|#\[test\]", body):
+                impl_blocks += 1
+            if cmd:
+                for h in HEREDOC_FILE_RE.findall(cmd):
+                    hb = h.rsplit("/", 1)[-1]
+                    if CODE_EXT_RE.search(hb) and h not in seen and hb not in expected:
+                        created[h] = bool(IMPLICIT_TEST_PATH_RE.search(h) or IMPLICIT_TEST_BODY_RE.search(cmd))
+                        seen.add(h)
+                made = {h.rsplit("/", 1)[-1] for h in HEREDOC_FILE_RE.findall(cmd)}
+                for p in created:
+                    b = p.rsplit("/", 1)[-1]
+                    if b not in made and b in cmd and EXEC_RE.search(cmd):
+                        ran.add(p)
             if name in NET_TOOLS or NET_RE.search(cmd or text_of(args)) and not LOCAL_URL_RE.search(cmd or text_of(args)):
                 s["net_calls"] += 1
             if FETCH_RE.search(cmd or text_of(args)) and RECALL_SITE_RE.search(cmd or text_of(args)):
@@ -249,6 +311,9 @@ def trajectory_stats(path: Path) -> dict:
                 elif BUILD_RE.search(cmd):
                     s["build_runs"] += 1
                     s["build_fail_runs"] += failed
+    mine = [p.rsplit("/", 1)[-1] for p, implicit in created.items() if implicit or (p in ran and TESTISH_NAME_RE.search(p.rsplit("/", 1)[-1]))]
+    s["own_tests"] = len(mine) + impl_blocks
+    s["own_test_files"] = ",".join(dict.fromkeys(mine + ["(test block in task file)"] * (impl_blocks > 0)))
     s["markup_final"] = int(bool(MARKUP_RE.search(last_agent_msg)))
     s["recall_content"] = recall_content("\n".join(own_text))
     s["tools"] = ",".join(f"{k}:{v}" for k, v in sorted(tools.items(), key=lambda kv: -kv[1]))
@@ -723,7 +788,7 @@ def main() -> None:
             "cached_tokens": ar.get("n_cache_tokens", ""),
             "out_tokens": ar.get("n_output_tokens", ""),
         }
-        row.update(trajectory_stats(tdir / "agent" / "trajectory.json"))
+        row.update(trajectory_stats(tdir / "agent" / "trajectory.json", frozenset(expected_files(tdir))))
         row.update(thinking_stats(tdir / "agent"))
         row["instr_names_source"] = int(bool(RECALL_RE.search(instr_text(tdir))))
         if tdir.parent.name not in px_cache:
@@ -752,6 +817,13 @@ def main() -> None:
                     key=lambda p: p["out_tokens_before"], default=None)
         row["first_pass_requests"] = first["requests_before"] if first else ""
         row["first_pass_out_tokens"] = first["out_tokens_before"] if first else ""
+        # what the agent spent after that (a clean finish is 1-2 requests: the summary).
+        # A lower bound when the pass was first seen by a progress sample, not a call
+        tot_req, tot_out = row.get("px_requests") or 0, row.get("px_output_tokens") or 0
+        if first and tot_req:
+            row["post_pass_requests"] = max(0, tot_req - first["requests_before"])
+            row["post_pass_out_tokens"] = max(0, tot_out - first["out_tokens_before"])
+            row["post_pass_frac"] = round(row["post_pass_out_tokens"] / tot_out, 3) if tot_out else ""
         row["_progress"] = pts
         # server slowdowns: a timed-out trial that lost time to them is invalid (the limit
         # was eaten by the server, not the model); a finished one gets its agent time
