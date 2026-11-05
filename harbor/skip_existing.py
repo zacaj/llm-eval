@@ -35,6 +35,10 @@ SERVER_SKIP = {"srv.eff.reasoning_budget"}
 
 def server_sig(text: str) -> dict[str, str]:
     kv = dict(l.split("=", 1) for l in text.splitlines() if "=" in l)
+    # srv.eff.thinking was added to the capture later; older jobs lack it. Thinking is only
+    # off when the effort is off (EFFORT=off), so a known effort level implies thinking on.
+    if "srv.eff.thinking" not in kv and "srv.eff.reasoning_effort" in kv:
+        kv["srv.eff.thinking"] = "False" if kv["srv.eff.reasoning_effort"] in ("off", "none", "") else "True"
     # *_source keys say where a value came from (e.g. "backfilled"), not what ran
     return {k: v for k, v in kv.items() if SERVER_KEYS.match(k) and not k.endswith("_source")
             and k not in SERVER_SKIP}
@@ -71,6 +75,18 @@ def time_limit_matches(r: dict, limit: int, want_limit: int, base: int, want_bas
     return t is not None and t <= want_limit
 
 
+def budget_matches(r: dict, budget: int, want: int) -> bool:
+    """Same eval token budget = same run. A trial whose budget never bit (no "budget
+    exhausted" stop) used fewer tokens than its own cap; if that cap was <= the wanted
+    one, the wanted cap would never have bit either, so it played out identically. A
+    trial that hit its cap only matches the same cap."""
+    if budget == want:
+        return True
+    if budget > want:
+        return False
+    return "budget exhausted" not in ((r.get("exception_info") or {}).get("exception_message") or "")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", type=Path, required=True)
@@ -105,8 +121,7 @@ def main() -> None:
         agents = cfg.get("agents") or [{}]
         cj = json.dumps(agents)
         m = re.search(r"X-Eval-Budget\W+(\d+)", cj)
-        if (int(m.group(1)) if m else 0) != a.budget:
-            continue
+        job_budget = int(m.group(1)) if m else 0
         if think_budget(job) != want_think:
             continue
         scale = dur_scale(job)
@@ -130,6 +145,8 @@ def main() -> None:
             src = task_path if (task_path / "task.toml").exists() else a.dataset / task
             limit = round(task_timeout(src) * mult)
             want_limit = round(float(a.max_dur)) if a.max_dur else round(task_timeout(a.dataset / task))
+            if not budget_matches(r, job_budget, a.budget):
+                continue
             if time_limit_matches(r, limit, want_limit, round(limit / scale), want_base):
                 have[task] += 1
                 where[task][job.name] = where[task].get(job.name, 0) + 1
