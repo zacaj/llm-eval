@@ -1,17 +1,21 @@
-# <task> <test calls> <max_dur>
-
-# probationary
-cancel-async-tasks              5      900    # hard: asyncio concurrency + KeyboardInterrupt cancellation
-headless-terminal               5      900    # pty-backed interactive terminal driver (system-python task)
-fix-code-vulnerability          5      900    # hard: find/fix a CWE in Bottle; also gated on Bottle's own suite (counted as 1 test)
+# <task> <test calls> budget=<output tokens>
+# Budget-limited (harbor.sh --list): no failing time limit, only a backstop. The old
+# failing limits are kept as "max_dur N" in the comments for the record.
+# Budgets (2026-11-05) = max(1.5 x p90, 1.1 x max) of output tokens to first pass over
+# earlier harbor trials, rounded up to 10k, floor 20k.
 
 # aider - mostly somewhat known but still give some good differentiatoin
-javascript     scale-generator           4  600   # known but not often
-javascript     zebra-puzzle              5  800   # never recalled!
-python         paasio                    6  600   # 6/10 recall, but 24/32 pass
-rust           forth                     4  500   # sometimes recalled but still often fail?
+#javascript     zebra-puzzle              5  budget=25k   # max_dur 800; never recalled!
+javascript     scale-generator           4  budget=45k   # max_dur 600; known but not often
+python         paasio                    6  budget=50k   # max_dur 600; 6/10 recall, but 24/32 pass
+rust           forth                     4  budget=40k   # max_dur 500; sometimes recalled but still often fail?
+
+# probationary
+cancel-async-tasks              5      budget=55k   # max_dur 900; hard: asyncio concurrency + KeyboardInterrupt cancellation
+headless-terminal               5      budget=70k   # max_dur 900; pty-backed interactive terminal driver (system-python task)
+#fix-code-vulnerability          5      budget=20k   # max_dur 900; hard: find/fix a CWE in Bottle; also gated on Bottle's own suite (counted as 1 test)
+
 
 # TB2
-cobol-modernization             5      900    # only TB2 task with pass/fail spread; models skip run-tests and over-verify
-custom-memory-heap-crash        5      1800   # requests to pass and post-pass work differ by model
-
+#cobol-modernization             5      budget=90k   # max_dur 900; only TB2 task with pass/fail spread; models skip run-tests and over-verify.  very slow and not getting that much data out of it
+custom-memory-heap-crash        5      budget=70k   # max_dur 1800; requests to pass and post-pass work differ by model

@@ -1,16 +1,20 @@
 # Terminal-Bench 2 pilot set (harbor/tasks/tb2, test-calls variants in tasks/tb2_tc).
-# Format matches the other lists: <task>  [test_calls]  [max_dur_sec]
-# max_dur = the task's own agent timeout from its task.toml.
+# Format matches the other lists: <task>  [test_calls]  [max_dur_sec]  [budget=<tokens>]
+# A max_dur is a failing time limit (legacy); budget= without one = budget-limited, the
+# time limit is only a backstop (harbor.sh --list). The old max_durs (the tasks' own
+# agent timeouts) are kept as "max_dur N" in the comments for the record.
+# Budgets (2026-11-05) = max(1.5 x p90, 1.1 x max) of output tokens to first pass over
+# earlier harbor trials, rounded up to 10k, floor 20k.
 # Mixable with polyglot rows in one list (harbor.sh run --list); calls -> tasks/tb2_tc/<task>__tc<N>
 # (missing ones are generated when TB2_SRC=<terminal-bench-2 checkout> is set).
 #
-# task                          calls  max_dur
-cobol-modernization             5      900
-constraints-scheduling          5      1200
-financial-document-processor    5      1200
-custom-memory-heap-crash        5      1800
-multi-source-data-merger        5      900
-db-wal-recovery                 5      900
-cancel-async-tasks              5      900    # hard: asyncio concurrency + KeyboardInterrupt cancellation
-headless-terminal               5      900    # pty-backed interactive terminal driver (system-python task)
-fix-code-vulnerability          5      900    # hard: find/fix a CWE in Bottle; also gated on Bottle's own suite (counted as 1 test)
+# task                          calls  budget
+cobol-modernization             5      budget=90k   # max_dur 900
+constraints-scheduling          5      budget=20k   # max_dur 1200
+financial-document-processor    5      budget=30k   # max_dur 1200
+custom-memory-heap-crash        5      budget=60k   # max_dur 1800
+multi-source-data-merger        5      budget=20k   # max_dur 900
+db-wal-recovery                 5      budget=60k   # max_dur 900
+cancel-async-tasks              5      budget=50k   # max_dur 900; hard: asyncio concurrency + KeyboardInterrupt cancellation
+headless-terminal               5      budget=80k   # max_dur 900; pty-backed interactive terminal driver (system-python task)
+fix-code-vulnerability          5      budget=20k   # max_dur 900; hard: find/fix a CWE in Bottle; also gated on Bottle's own suite (counted as 1 test)
