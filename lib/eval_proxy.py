@@ -9,13 +9,25 @@ prompt-logger proxy, which stays about the engine (filters, reasoning cap, route
 
   * Per-trial output-token budget. The agent sends "X-Eval-Budget: N"; requests are
     keyed by session (X-Eval-Session header -- terminus-2 -- else Claude Code's
-    metadata.user_id). max_tokens is clamped to what's left, and once fewer than
-    --min-tokens remain the request is rejected with "eval token budget exhausted"
+    metadata.user_id). Requests go out with their max_tokens unchanged (a clamp to
+    what's left would also shrink Strata's thinking cap, which it sets to 75% of
+    max_tokens), so the last request can overshoot; once fewer than --min-tokens
+    remain the next request is rejected with "eval token budget exhausted"
     (Claude Code exits on it; harbor_ext.BudgetedTerminus2 maps it to a graded stop).
     Upstream gets "X-Eval-Budget: 0": still eval mode there (no routes) but unlimited.
+  * Per-task settings (--settings, harbor.sh's jobs/<job>/eval-settings.json): each
+    session is bound to its task by finding the task's instruction text in its user
+    messages, and that task's budget replaces the X-Eval-Budget header (which stays the
+    fallback for unmatched sessions). Logged in the "task" column.
   * One TSV row per request with what the server says it actually did, from
     strata_effective (the final message_delta when streaming): effort, thinking
     budget, reasoning/answer tokens, stop reason. collect.py joins the rows to trials.
+  * Timing: duration_ms = the whole request as the agent saw it (queue + prompt
+    processing + generation); first_byte_ms = until upstream's first response bytes
+    (an SSE stream may open before generation starts, so this is not time-to-first-
+    token); srv_prompt_ms / srv_predicted_ms = the server's own compute time, when the
+    response carries llama.cpp-style "timings" (blank otherwise). With those,
+    duration - prompt - predicted = time spent queued (collect.py's px_queue_sec).
 
 Responses are streamed through as they arrive (never buffered); only a small tail of
 each SSE line is parsed. stdlib only.
@@ -40,12 +52,66 @@ HOP = {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "te"
        "upgrade", "host", "content-length", "accept-encoding"}
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 COLUMNS = ["timestamp", "session", "path", "budget", "max_tokens_sent", "output_tokens", "total_output",
-           "stop_reason", "effort", "reasoning_budget", "reasoning_tokens", "answer_tokens",
-           "budget_cutoff", "duration_ms", "tok_s", "note"]
+           "stop_reason", "effort", "reasoning_budget", "reasoning_budget_eff", "reasoning_tokens",
+           "answer_tokens", "budget_cutoff", "duration_ms", "tok_s", "first_byte_ms", "srv_prompt_ms", "srv_predicted_ms",
+           "task", "note", "srv_notes"]
 
 args = None
 spent: dict[str, int] = {}
 lock = threading.Lock()
+# --settings (harbor.sh's jobs/<job>/eval-settings.json): per-task settings, and which task
+# a session runs, found from the task's instruction in its prompt (Claude Code sends it
+# verbatim as the first user message, terminus-2 inside its template)
+task_settings: list[dict] = []        # [{"name", "budget", "instruction"}]
+session_task: dict[str, dict | None] = {}
+
+
+def load_settings(path: str) -> None:
+    d = json.load(open(path, encoding="utf-8"))
+    seen: dict[str, dict] = {}
+    for t in d.get("tasks", []):
+        try:
+            instr = open(t["instruction"], encoding="utf-8").read().strip()
+        except OSError as e:
+            sys.exit(f"eval proxy: settings: can't read {t.get('instruction')}: {e}")
+        prev = seen.get(instr)
+        if prev and prev["budget"] != t.get("budget", 0):
+            sys.exit(f"eval proxy: settings: {prev['name']} and {t['name']} have the same instruction "
+                     f"but different budgets; a session can't tell them apart")
+        if not instr or prev:
+            continue
+        seen[instr] = {"name": t["name"], "budget": int(t.get("budget") or 0), "instruction": instr}
+    # longest first: an instruction that contains another task's wins
+    task_settings.extend(sorted(seen.values(), key=lambda t: -len(t["instruction"])))
+
+
+def user_text(data) -> str:
+    out = []
+    for m in (data or {}).get("messages") or []:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, list):
+            out += [b.get("text", "") for b in c if isinstance(b, dict) and isinstance(b.get("text"), str)]
+    return "\n".join(out)
+
+
+def task_of(key: str, data) -> dict | None:
+    """The settings entry of the task this session runs (cached per session), or None."""
+    if not task_settings or not key:
+        return None
+    with lock:
+        if key in session_task:
+            return session_task[key]
+    text = user_text(data)
+    hit = next((t for t in task_settings if t["instruction"] in text), None)
+    with lock:
+        # an unmatched session is retried on its next request (its instruction may come later)
+        if hit is not None:
+            session_task[key] = hit
+    return hit
 
 
 def log_row(**kw):
@@ -69,6 +135,8 @@ class Stats:
         self.out = 0
         self.stop = ""
         self.eff: dict = {}
+        self.timings: dict = {}
+        self.raw_keys: set = set()
         self.buf = b""
 
     def feed_json(self, d):
@@ -82,8 +150,11 @@ class Stats:
         for ch in d.get("choices") or []:
             if isinstance(ch, dict) and ch.get("finish_reason"):
                 self.stop = ch["finish_reason"]
+        if isinstance(d.get("timings"), dict):
+            self.timings = d["timings"]   # llama.cpp: prompt_ms / predicted_ms (last one = totals)
         if isinstance(d.get("strata_effective"), dict):
             self.eff = d["strata_effective"]
+            self.raw_keys.add("strata_effective")
         elif isinstance(d.get("llama_effective"), dict):
             # llama.cpp's equivalent: same keys except the budget in effect is "reasoning_budget"
             self.eff = dict(d["llama_effective"])
@@ -97,7 +168,8 @@ class Stats:
             line = line.strip()
             # only the events that can carry usage / strata_effective, not every token delta
             if line.startswith(b"data:") and (b"usage" in line or b"strata_effective" in line or b"llama_effective" in line
-                                               or b"finish_reason\": \"" in line or b"stop_reason" in line):
+                                               or b"finish_reason\": \"" in line or b"stop_reason" in line
+                                               or b"\"timings\"" in line):
                 try:
                     self.feed_json(json.loads(line[5:]))
                 except ValueError:
@@ -128,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def forward(self, body):
         path = self.path.split("?", 1)[0]
-        data, key, budget, sent_max = None, "", 0, ""
+        data, key, budget, sent_max, task_name = None, "", 0, "", ""
         inference = body and path in INFERENCE_PATHS
         if inference:
             try:
@@ -149,24 +221,34 @@ class Handler(BaseHTTPRequestHandler):
                 # EFFORT=off (harbor.sh passes -1): reasoning disabled, max_tokens left as sent
                 data["thinking"] = {"type": "disabled"}
                 body = json.dumps(data).encode()
+            if args.temperature is not None and isinstance(data, dict):
+                # TEMPERATURE=0 (greedy) from harbor.sh: overrides whatever the agent sent
+                data["temperature"] = args.temperature
+                body = json.dumps(data).encode()
             try:
                 budget = int(self.headers.get("X-Eval-Budget") or 0)
             except ValueError:
                 budget = 0
+            # per-task settings (--settings) win over the agent's job-wide header
+            t = task_of(key, data) if isinstance(data, dict) else None
+            task_name = t["name"] if t else ""
+            if t:
+                budget = t["budget"]
             if budget > 0 and key and isinstance(data, dict):
                 with lock:
                     remaining = budget - spent.get(key, 0)
                 if remaining < min(args.min_tokens, budget):
-                    log_row(timestamp=now(), session=key, path=path, budget=budget,
+                    log_row(timestamp=now(), session=key, path=path, budget=budget, task=task_name,
                             total_output=budget - remaining, note="rejected")
                     msg = {"type": "error", "error": {"type": "invalid_request_error", "message": BUDGET_MSG}} \
                         if path == "/v1/messages" else \
                         {"error": {"message": BUDGET_MSG, "type": "invalid_request_error", "code": "budget_exhausted"}}
                     return self.send_json(400, msg)
-                field = "max_completion_tokens" if "max_completion_tokens" in data else "max_tokens"
-                cur = data.get(field)
-                data[field] = min(cur, remaining) if isinstance(cur, int) else remaining
-                body = json.dumps(data).encode()
+                # max_tokens is NOT clamped to what's left: Strata arms min(thinking budget,
+                # 0.75*max_tokens), so a clamp silently shrank the configured thinking cap late
+                # in a trial. The last request may overshoot the budget by up to one full
+                # request; the next one is rejected (collect.py / the viz score against the
+                # budget using per-request token counts).
             if isinstance(data, dict) and args.model and data.get("model") != args.model:
                 # the agent is configured with a descriptive name (e.g. the GGUF); the
                 # server wants its own id
@@ -185,6 +267,7 @@ class Handler(BaseHTTPRequestHandler):
             up.hostname, up.port or (443 if up.scheme == "https" else 80), timeout=args.timeout)
         stats = Stats()
         t0 = time.monotonic()
+        t_first = None
         try:
             conn.request(self.command, (up.path.rstrip("/") + self.path), body=body, headers=hdrs)
             resp = conn.getresponse()
@@ -201,6 +284,8 @@ class Handler(BaseHTTPRequestHandler):
                 chunk = resp.read1(65536)
                 if not chunk:
                     break
+                if t_first is None:
+                    t_first = time.monotonic()
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                 self.wfile.flush()
                 if inference:
@@ -218,7 +303,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         except OSError as e:
             if inference:
-                log_row(timestamp=now(), session=key, path=path, budget=budget, note=f"upstream error: {e}")
+                log_row(timestamp=now(), session=key, path=path, budget=budget, task=task_name, note=f"upstream error: {e}")
             try:
                 self.send_json(502, {"error": {"message": f"eval proxy: upstream error: {e}"}})
             except OSError:
@@ -232,14 +317,25 @@ class Handler(BaseHTTPRequestHandler):
             e = stats.eff
             rb = e.get("reasoning_budget_requested")
             rt = e.get("reasoning_tokens")
+            # the budget actually armed: Strata cuts the requested one to 75% of max_tokens to
+            # leave room for the answer ("budget N cut to M" in notes; reasoning_budget = M)
+            rbe = e.get("reasoning_budget") if "strata_effective" in stats.raw_keys else rb
+            if not isinstance(rbe, int):
+                rbe = rb
             dur = time.monotonic() - t0
-            log_row(timestamp=now(), session=key, path=path, budget=budget, max_tokens_sent=sent_max,
+            tm = stats.timings
+            ms = lambda k: round(tm[k]) if isinstance(tm.get(k), (int, float)) else ""
+            log_row(first_byte_ms=round((t_first - t0) * 1000) if t_first is not None else "",
+                    srv_prompt_ms=ms("prompt_ms"), srv_predicted_ms=ms("predicted_ms"), task=task_name,
+                    timestamp=now(), session=key, path=path, budget=budget, max_tokens_sent=sent_max,
                     output_tokens=stats.out, total_output=total, stop_reason=stats.stop,
                     effort=e.get("reasoning_effort", ""), reasoning_budget=rb if rb is not None else "",
+                    reasoning_budget_eff=rbe if rbe is not None else "",
+                    srv_notes="; ".join(map(str, e.get("notes") or [])).replace("\t", " ").replace("\n", " "),
                     reasoning_tokens=rt if rt is not None else "",
                     answer_tokens=e.get("answer_tokens", ""),
                     # reasoning_tokens includes Strata's injected cut-off line, so >= budget = cut off
-                    budget_cutoff=int(rt >= rb) if isinstance(rt, int) and isinstance(rb, int) and rb > 0 else "",
+                    budget_cutoff=int(rt >= rbe) if isinstance(rt, int) and isinstance(rbe, int) and rbe > 0 else "",
                     # wall time incl. prompt processing; tok_s = output / wall time, so a
                     # server-side slowdown (GPU contention etc.) shows up per request
                     duration_ms=round(dur * 1000), tok_s=f"{stats.out / dur:.1f}" if dur > 0 and stats.out else "")
@@ -259,12 +355,19 @@ def main():
     ap.add_argument("--min-tokens", type=int, default=256)
     ap.add_argument("--model", default="", help="rewrite each request's model field to this server id")
     ap.add_argument("--timeout", type=float, default=3600)
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="override each inference request's temperature (0 = greedy); default: leave as sent")
     ap.add_argument("--think-budget", type=int, default=0,
                     help="set thinking to enabled/budget_tokens=N on /v1/messages (0 = leave the request alone, "
                          "-1 = thinking disabled)")
     ap.add_argument("--answer-tokens", type=int, default=8000,
                     help="with --think-budget: max_tokens = think budget + this (answer/tool-call headroom)")
+    ap.add_argument("--settings", default="",
+                    help="per-task settings JSON (harbor.sh's eval-settings.json): {\"tasks\": [{\"name\", "
+                         "\"budget\", \"instruction\": <instruction.md path>}]}")
     args = ap.parse_args()
+    if args.settings:
+        load_settings(args.settings)
     header = "\t".join(COLUMNS)
     try:
         with open(args.log, encoding="utf-8") as f:

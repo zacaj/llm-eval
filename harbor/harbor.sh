@@ -29,10 +29,20 @@ set -euo pipefail
 #
 # --list FILE: exercise list in run.sh's fromfile format ("<language> <exercise>
 # [max_tries] [max_dur]" or bare "<exercise>" = every language; "#" comments), so
-# the lists/*.txt shortlists work as-is. Each entry becomes an `-i` include
-# glob. max_dur (seconds) is honoured: entries are grouped by it and each group
-# runs as its own Harbor job (suffix -d<secs>) with a matching
-# --agent-timeout-multiplier. max_tries has no Harbor equivalent (ignored, warned).
+# the lists/*.txt shortlists work as-is. TB2 rows: "<task> [calls] [max_dur]".
+# Any row may also carry key=value options anywhere (run.sh ignores them):
+#   budget=<N>[k]  this row's output-token budget (overrides BUDGET)
+# Two kinds of limit:
+#   * a row with a max_dur (or MAX_DUR set) has a FAILING time limit (legacy): when it
+#     runs out the attempt ends and the work is graded as it is.
+#   * a row with a budget and no max_dur is budget-limited: its time limit is only a
+#     BACKSTOP against stuck trials, set far above what the budget needs (BACKSTOP_MULT
+#     below); a trial that hits it is a harness failure (collect.py marks it INVALID,
+#     SKIP_EXISTING reruns it). Task copies under tasks/_backstop/; tb2_tc instructions
+#     state the budget instead of a time limit.
+# Rows with neither keep the task's own (failing) timeout. Per-task budgets go to the eval
+# proxy in jobs/<job>/eval-settings.json (it matches each session to its task by the
+# instruction text), so rows with different budgets still share one job.
 #
 # Env:
 #   BASE_URL   model server root, no /v1 (default: NAS prompt-logger proxy)
@@ -42,15 +52,18 @@ set -euo pipefail
 #              Job names are <run id>_<tasks>[_d<max_dur>][_k<attempts>]_<agent>[-b<budget>]:
 #              tasks = up to 4 short names (go-bowling.tc6), else <list name>.<count>;
 #              model and the rest are in the job's config / collect.py columns
-#   MAX_DUR    agent wall-clock limit per trial in seconds, for entries without their
-#              own max_dur (default: the task's own agent timeout, 1800s for polyglot)
-#   MAX_DUR_SCALE  multiplier on every agent time limit (list max_dur, MAX_DUR, or the
-#              task default) for slower models, as in run.sh: a number (default 1) or
-#              auto = max(1, AUTO_SCALE_BASE_TPS(100) / the server's measured decode tok/s).
-#              Job names / max_dur column use the scaled limit; SKIP_EXISTING matches
-#              on the unscaled one, so auto-scale drift between jobs doesn't split runs.
-#   BUDGET     per-trial output-token budget (default 0 = unlimited), enforced by
-#              eval_proxy.py (see EVAL_PROXY_HOST below)
+#   MAX_DUR    failing agent wall-clock limit per trial in seconds, for entries without
+#              their own max_dur (default: the task's own agent timeout, 1800s for polyglot)
+#              Every failing limit (list max_dur, MAX_DUR, or the task default) is scaled
+#              for slower models by max(1, AUTO_SCALE_BASE_TPS(100) / the server's measured
+#              decode tok/s) -- always (MAX_DUR_SCALE is gone; oracle/nop run at 1x). The
+#              max_dur column uses the scaled limit; SKIP_EXISTING matches on the unscaled
+#              one, so scale drift between jobs doesn't split runs.
+#   BUDGET     per-trial output-token budget for rows without budget= (default 0 =
+#              unlimited), enforced by eval_proxy.py (see EVAL_PROXY_HOST below)
+#   BACKSTOP_MULT  budget-limited rows' backstop time limit = this x (budget / measured
+#              decode tok/s), and at least the task's own timeout x the scale (default 5:
+#              the probe reads up to ~2.4x high on llama, see docs)
 #   SERVER_URL model server itself, not the proxy (default http://$NAS_HOST:8080); its
 #              sampling/quality settings are saved to jobs/<job>/server-settings.txt
 #              (same capture as run.sh's srv.* columns, via ../lib/server-capture.sh)
@@ -62,11 +75,13 @@ set -euo pipefail
 #              run.sh's REASONING_EFFORT default -- Claude Code's own default is high,
 #              which Strata resolves to xhigh). What the server actually resolved is
 #              recorded as srv.eff.reasoning_effort / srv.eff.reasoning_budget.
-#              Also sets the thinking cap (eval_proxy.py --think-budget): low 6000,
-#              medium 12000, high/xhigh 24000; max_tokens = cap + ANSWER_TOKENS.
+#              Also sets the thinking cap (eval_proxy.py --think-budget): low 8000,
+#              medium 16000, high/xhigh 24000; max_tokens = cap + ANSWER_TOKENS.
 #              off = reasoning disabled: Claude Code gets CLAUDE_CODE_DISABLE_THINKING=1
 #              and the proxy sends thinking {"type":"disabled"} (THINK_BUDGET=-1), so
 #              terminus-2 is covered too.
+#   TEMPERATURE    force every request's temperature via the eval proxy (0 = greedy);
+#              unset = whatever the agent sends. Recorded in run-settings.txt.
 #   THINK_BUDGET   override the thinking cap (0 = leave the request as Claude Code sent it,
 #              -1 = thinking disabled)
 #   ANSWER_TOKENS  answer/tool-call headroom added to the cap for max_tokens (default 8000)
@@ -122,8 +137,15 @@ if [ -z "$DATASET_FORCED" ]; then
     [ "$TC" = 1 ] && DATASET="$TC_DATASET" || DATASET="$CLASSIC_DATASET"
 fi
 BUDGET="${BUDGET:-0}"
+case "$BUDGET" in *[kK]) BUDGET=$(( ${BUDGET%[kK]} * 1000 )) ;; esac
+[[ "$BUDGET" =~ ^[0-9]+$ ]] || { echo "ERROR: BUDGET='$BUDGET' is not a token count (e.g. 60000 or 60k)" >&2; exit 1; }
 MAX_DUR="${MAX_DUR:-}"
-MAX_DUR_SCALE="${MAX_DUR_SCALE:-1}"
+if [ -n "${MAX_DUR_SCALE:-}" ]; then
+    echo "note: MAX_DUR_SCALE is no longer used (time limits always auto-scale); ignoring MAX_DUR_SCALE=$MAX_DUR_SCALE" >&2
+    unset MAX_DUR_SCALE
+fi
+dur_scale=1   # resolved from the measured decode speed before the run (oracle/nop: 1)
+BACKSTOP_MULT="${BACKSTOP_MULT:-5}"
 EFFORT="${EFFORT:-low}"
 case "$EFFORT" in
   low)          _THINK_BUDGET=8000 ;;
@@ -134,6 +156,9 @@ case "$EFFORT" in
 esac
 THINK_BUDGET="${THINK_BUDGET:-$_THINK_BUDGET}"
 ANSWER_TOKENS="${ANSWER_TOKENS:-8000}"
+# TEMPERATURE: eval_proxy.py overwrites every request's temperature (0 = greedy; Strata also needs 0
+# to keep MTP on for a3b models). Unset = leave what the agent sent.
+TEMPERATURE="${TEMPERATURE:-}"
 DISALLOWED_TOOLS="${DISALLOWED_TOOLS-Agent,WebFetch,WebSearch}"
 # PARALLEL_TOOLS=1 (default): appends a system-prompt line asking Claude Code to batch independent
 # tool calls into one turn (fewer model round trips per trial). 0 = Claude Code's stock prompt.
@@ -146,16 +171,35 @@ SERVER_URL="${SERVER_URL:-http://$NAS_HOST:3002}"
 
 LANGS=" python go rust javascript java cpp "
 
-# Print one "<dataset>\t<max_dur or ->\t<include glob>" line per entry of a
-# fromfile-format list (polyglot rows, or TB2 rows `<task> [calls] [max_dur]` for a
-# task dir under tasks/tb2; dataset per the TC rules above), generating any missing
-# __tc<count> test-calls task on the way.
+# budget=60k / budget=60000 -> 60000
+parse_budget() {
+    case "$1" in
+    *[kK]) [[ "${1%[kK]}" =~ ^[0-9]+$ ]] && echo $(( ${1%[kK]} * 1000 )) && return ;;
+    *) [[ "$1" =~ ^[0-9]+$ ]] && echo "$1" && return ;;
+    esac
+    return 1
+}
+
+# Print one "<dataset>\t<max_dur or ->\t<task default timeout or ->\t<budget or ->\t<include glob>"
+# line per entry of a fromfile-format list (polyglot rows, or TB2 rows `<task> [calls]
+# [max_dur]` for a task dir under tasks/tb2; dataset per the TC rules above; key=value
+# options as in the header), generating any missing __tc<count> test-calls task on the way.
 list_entries() {
-    local file="$1" warned=0 line lang ex tries dur
+    local file="$1" warned=0 line lang ex tries dur budget w def
+    local -a words toks
     [ -f "$file" ] || { echo "list file not found: $file" >&2; exit 1; }
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%%#*}"
-        read -r lang ex tries dur <<<"$line"
+        budget="-"; toks=()
+        read -ra words <<<"$line"
+        for w in "${words[@]}"; do
+            case "$w" in
+            budget=*) budget=$(parse_budget "${w#budget=}") || { echo "bad budget '$w' in $file" >&2; exit 1; } ;;
+            *=*) echo "unknown option '$w' in $file" >&2; exit 1 ;;
+            *) toks+=("$w") ;;
+            esac
+        done
+        read -r lang ex tries dur <<<"${toks[*]}"
         [ -z "$lang" ] && continue
         if [[ "$LANGS" != *" $lang "* && -d "$TB2_DATASET/$lang" ]]; then
             # Terminal-Bench 2 row: <task> [calls] [max_dur]; calls -> tb2_tc/<task>__tc<calls>
@@ -178,17 +222,17 @@ list_entries() {
                     tglob="${task}__tc*"
                 fi
             fi
-            if [ -z "$dur" ] && [ -z "$MAX_DUR" ]; then   # the task's own agent timeout
-                tdir=$(cd "$tds" 2>/dev/null && compgen -G "$tglob" | head -1)
-                [ -n "$tdir" ] && dur=$(awk '/^\[agent\]/{a=1;next} /^\[/{a=0} a && /^timeout_sec/{print int($3); exit}' "$tds/$tdir/task.toml")
-            fi
-            printf '%s\t%s\t%s\n' "$tds" "${dur:--}" "$tglob"
+            def=""   # the task's own agent timeout (polyglot's is the dataset-wide base_timeout)
+            tdir=$(cd "$tds" 2>/dev/null && compgen -G "$tglob" | head -1)
+            [ -n "$tdir" ] && def=$(awk '/^\[agent\]/{a=1;next} /^\[/{a=0} a && /^timeout_sec/{print int($3); exit}' "$tds/$tdir/task.toml")
+            printf '%s\t%s\t%s\t%s\t%s\n' "$tds" "${dur:--}" "${def:--}" "$budget" "$tglob"
             continue
         fi
         if [[ "$LANGS" != *" $lang "* ]]; then
             ex="$lang"; lang="*"; tries=""; dur=""   # bare exercise: all languages, no overrides
         fi
         [[ "$tries" =~ ^[0-9]+$ ]] || tries=""
+        [[ "$dur" =~ ^[0-9]+$ ]] || dur=""
         local glob="polyglot_${lang}_${ex}" ds="$CLASSIC_DATASET"
         if [ -n "$DATASET_FORCED" ]; then
             ds="$DATASET_FORCED"
@@ -210,8 +254,27 @@ list_entries() {
             echo "note: TC=0, ignoring the try-count column in $file" >&2
             warned=1
         fi
-        printf '%s\t%s\t%s\n' "$ds" "${dur:--}" "$glob"
+        printf '%s\t%s\t-\t%s\t%s\n' "$ds" "${dur:--}" "$budget" "$glob"
     done <"$file"
+}
+
+# resolve_group "<dataset>|<max_dur>|<task default>|<budget>" <scale> <decode tok/s>
+# -> g_ds g_budget g_mode (fail|backstop, see --list above) g_secs (the limit the trial
+# runs with) g_base (fail mode: the unscaled limit, for SKIP_EXISTING; backstop: empty)
+resolve_group() {
+    local d def b
+    IFS='|' read -r g_ds d def b <<<"$1"
+    [ "$b" = "-" ] && b="$BUDGET"; g_budget="${b:-0}"
+    [ "$d" = "-" ] && d="$MAX_DUR"
+    [ "$def" = "-" ] && def="$base_timeout"
+    if [ -z "$d" ] && [ "$g_budget" -gt 0 ]; then
+        g_mode=backstop; g_base=""
+        g_secs=$(awk -v d="$def" -v s="$2" -v b="$g_budget" -v t="${3:-0}" -v m="$BACKSTOP_MULT" \
+            'BEGIN { x = d * s; if (t > 0) { y = m * b / t; if (y > x) x = y } else x = d * m; printf "%.0f", x }')
+    else
+        g_mode=fail; g_base="${d:-$def}"
+        g_secs=$(awk -v d="$g_base" -v s="$2" 'BEGIN { printf "%.0f", d * s }')
+    fi
 }
 
 # The dataset's own per-task agent timeout (polyglot: 1800), which
@@ -270,8 +333,18 @@ capture_server() (
 
 model_id() {
     if [ -n "${MODEL:-}" ]; then echo "$MODEL"; return; fi
-    curl -sf --max-time 10 "$BASE_URL/v1/models" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])'
+    local body id
+    if ! body=$(curl -sf --max-time 10 "$BASE_URL/v1/models"); then
+        echo "model_id: can't reach $BASE_URL/v1/models (curl failed; is the NAS proxy on :3002 running?)" >&2
+        echo "model_id: set MODEL=<name> to skip the lookup" >&2
+        return 1
+    fi
+    id=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null) || id=""
+    if [ -z "$id" ]; then
+        echo "model_id: $BASE_URL/v1/models returned no model id; body starts with: ${body:0:200}" >&2
+        return 1
+    fi
+    echo "$id"
 }
 
 cmd="${1:-}"; shift || true
@@ -284,22 +357,26 @@ gen)
 run)
     agent="${1:?usage: harbor.sh run <agent> [harbor args...]}"; shift
     passthru=()
-    declare -A groups=()   # "<dataset>|<max_dur or ->" -> newline-separated include globs
+    # "<dataset>|<max_dur or ->|<task default timeout or ->|<budget or ->" -> newline-separated
+    # include globs (resolve_group turns a key into the limit/budget it runs with)
+    declare -A groups=()
     while [ $# -gt 0 ]; do
         if [ "$1" = "--list" ]; then
             # resolve relative to the caller's cwd, not this script's dir
             f=$(resolve_list "$2"); list_file="$f"
             n=0
-            while IFS=$'\t' read -r ds dur glob; do
-                groups["$ds|$dur"]+="$glob"$'\n'; n=$((n + 1))
-            done < <(list_entries "$f")
+            entries=$(list_entries "$f") || exit 1
+            while IFS=$'\t' read -r ds dur def budget glob; do
+                [ -n "$ds" ] || continue
+                groups["$ds|$dur|$def|$budget"]+="$glob"$'\n'; n=$((n + 1))
+            done <<<"$entries"
             [ $n -gt 0 ] || { echo "no entries in $f" >&2; exit 1; }
             shift 2
         else
             passthru+=("$1"); shift
         fi
     done
-    [ ${#groups[@]} -gt 0 ] || groups["$DATASET|-"]=""
+    [ ${#groups[@]} -gt 0 ] || groups["$DATASET|-|-|-"]=""
 
     # Known test totals (aider_polyglot/expected-totals.tsv -> tasks' tests/expected_total) let the
     # verifier count tests that never ran as failed. For any selected exercise without
@@ -330,7 +407,7 @@ run)
             echo "EXPECTED_PREFILL: no known test total for $(echo $exs | wc -w) exercise(s); running the oracle first: $(echo $exs)" >&2
             oi=(); for e in $exs; do oi+=(-i "polyglot_$e"); done
             ( unset SWAP_CMD; CHECK="auto: expected test totals (EXPECTED_PREFILL)" TC=0 DATASET="" \
-                SKIP_EXISTING=0 MAX_DUR="" MAX_DUR_SCALE=1 "$PWD/harbor.sh" run oracle "${oi[@]}" ) \
+                SKIP_EXISTING=0 MAX_DUR="" BUDGET=0 "$PWD/harbor.sh" run oracle "${oi[@]}" ) \
                 || echo "EXPECTED_PREFILL: oracle run failed; continuing without totals" >&2
             # that run's collect.py updated aider_polyglot/expected-totals.tsv; regenerate what we're about to run
             ORACLE_SECRET=$(openssl rand -hex 16) python3 aider_polyglot/main.py \
@@ -371,20 +448,17 @@ run)
                     -i|--include) pglobs+=("${passthru[$((i + 1))]}") ;;
                     esac
                 done
-                pscale=1
-                if [ "$MAX_DUR_SCALE" = auto ]; then
-                    ptps=$(sed -n 's/^decode_tps=//p' "$prev/run-settings.txt" 2>/dev/null)
-                    pscale=$(awk -v t="${ptps:-0}" -v b="$AUTO_SCALE_BASE_TPS" 'BEGIN { s = (t > 0) ? b / t : 1; if (s < 1) s = 1; printf "%.2f", s }')
-                else pscale="$MAX_DUR_SCALE"; fi
+                ptps=$(sed -n 's/^decode_tps=//p' "$prev/run-settings.txt" 2>/dev/null)
+                pscale=$(awk -v t="${ptps:-0}" -v b="$AUTO_SCALE_BASE_TPS" 'BEGIN { s = (t > 0) ? b / t : 1; if (s < 1) s = 1; printf "%.2f", s }')
                 todo=0
                 for key in "${!groups[@]}"; do
-                    pds="${key%%|*}"; pdur="${key#*|}"; [ "$pdur" = "-" ] && pdur="$MAX_DUR"; pbase="${pdur:-$base_timeout}"
-                    if [ "$pscale" != 1 ]; then pdur=$(awk -v d="${pdur:-$base_timeout}" -v s="$pscale" 'BEGIN { printf "%.0f", d * s }'); fi
+                    resolve_group "$key" "$pscale" "$ptps"
                     pg=(); while IFS= read -r g; do [ -n "$g" ] && pg+=("$g"); done <<<"${groups[$key]}"
                     pg+=("${pglobs[@]}"); [ ${#pg[@]} -gt 0 ] || pg=("*")
                     while IFS=$'\t' read -r rem _; do todo=$((todo + rem)); done < <(
-                        python3 skip_existing.py --jobs jobs --dataset "$pds" --agent "$agent" ${CC_VERSION:+--agent-version "$CC_VERSION"} \
-                            --budget "$BUDGET" --think-budget "$THINK_BUDGET" --max-dur "${pdur:-$base_timeout}" --max-dur-base "$pbase" --k "$pk" --server "$prev/server-settings.txt" "${pg[@]}")
+                        python3 skip_existing.py --jobs jobs --dataset "$g_ds" --agent "$agent" ${CC_VERSION:+--agent-version "$CC_VERSION"} \
+                            --budget "$g_budget" --think-budget "$THINK_BUDGET" --temperature "$TEMPERATURE" --max-dur "$g_secs" --max-dur-base "$g_base" \
+                            --timeout-mode "$g_mode" --k "$pk" --server "$prev/server-settings.txt" "${pg[@]}")
                 done
                 if [ "$todo" -eq 0 ]; then
                     echo "SWAP_CMD: nothing left to run (per $prev); not swapping models" >&2
@@ -400,8 +474,25 @@ run)
     fi
 
     agent_spec="$agent"
-    hdrs="X-Eval-Budget: $BUDGET"
-    [ "$PROXY_FILTERS" = 0 ] && hdrs+=$'\nX-Eval-Filters: 0'
+    # budget_args <budget>: the agent's eval headers (X-Eval-Budget = the job-wide fallback
+    # budget; per-task budgets come from eval-settings.json) -> hdr_args, plus the job
+    # name's tail -> tail_part
+    budget_args() {
+        local hdrs="X-Eval-Budget: $1" hdr_json
+        [ "$PROXY_FILTERS" = 0 ] && hdrs+=$'\nX-Eval-Filters: 0'
+        hdr_args=()
+        case "$agent" in
+        # newline-separated; proxy keys the budget on Claude Code's per-session metadata.user_id
+        claude-code) hdr_args=(--ae "ANTHROPIC_CUSTOM_HEADERS=$hdrs") ;;
+        terminus-2)
+            hdr_json=$(printf '%s' "$hdrs" | python3 -c 'import json,sys; print(json.dumps(dict(l.split(": ",1) for l in sys.stdin.read().splitlines())))')
+            hdr_args=(--ak "llm_call_kwargs={\"extra_headers\": $hdr_json}") ;;
+        esac
+        case "$agent" in claude-code) tail_part=cc ;; terminus-2) tail_part=t2 ;; *) tail_part="$agent" ;; esac
+        if [ "$1" -gt 0 ]; then
+            tail_part+="-b$(( $1 >= 1000 ? $1 / 1000 : $1 ))$([ "$1" -ge 1000 ] && echo k)"
+        fi
+    }
     agent_args=()
     case "$agent" in
     oracle|nop)
@@ -425,9 +516,7 @@ run)
             # no telemetry/autoupdate/background title calls hitting the model server
             --ae CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
             --ae "CLAUDE_CODE_EFFORT_LEVEL=$claude_effort"
-            "${think_off_args[@]}"
-            # newline-separated; proxy keys the budget on Claude Code's per-session metadata.user_id
-            --ae "ANTHROPIC_CUSTOM_HEADERS=$hdrs")
+            "${think_off_args[@]}")
         ;;
     terminus-2)
         model=$(model_id); label="$model"
@@ -435,18 +524,14 @@ run)
         # budget rejection -> graded agent exit instead of an ungraded trial (harbor_ext.py)
         agent_spec="harbor_ext:BudgetedTerminus2"
         export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
-        hdr_json=$(printf '%s' "$hdrs" | python3 -c 'import json,sys; print(json.dumps(dict(l.split(": ",1) for l in sys.stdin.read().splitlines())))')
         agent_args=(-m "openai/$model" --ak "api_base=$EVAL_URL/v1"
             # per-trial session uuid -> X-Eval-Session (the proxy's budget key)
-            --ak 'session_id_headers=["X-Eval-Session"]'
-            --ak "llm_call_kwargs={\"extra_headers\": $hdr_json}")
+            --ak 'session_id_headers=["X-Eval-Session"]')
         ;;
     *)
         echo "no wiring for agent '$agent' yet (add a case in harbor.sh)" >&2; exit 1
         ;;
     esac
-    case "$agent" in claude-code) tail_part=cc ;; terminus-2) tail_part=t2 ;; *) tail_part="$agent" ;; esac
-    [ "$BUDGET" -gt 0 ] && tail_part+="-b$(( BUDGET >= 1000 ? BUDGET / 1000 : BUDGET ))$([ "$BUDGET" -ge 1000 ] && echo k)"
     run_id="${JOB_NAME:-$(date +%m%d-%H%M%S)}"
     list_name=""; [ -n "${list_file:-}" ] && { list_name=$(basename "$list_file"); list_name="${list_name%.*}"; }
     # job name: run id, then what's in it (short task names), then the rest; see JOB_NAME above
@@ -506,15 +591,17 @@ run)
         [ -z "${SWAP_CMD:-}" ] || printf '%s\n' "$SWAP_CMD" > "jobs/$job/swap-cmd.txt"
         # CHECK=<reason>: a harness test, not a model result (collect.py -> harbor-trials-checks.tsv)
         [ -z "${CHECK:-}" ] || printf '%s\n' "$CHECK" > "jobs/$job/CHECK"
-        printf 'max_dur_scale=%s\nmax_dur_base=%s\ndecode_tps=%s\n' \
-            "$MAX_DUR_SCALE" "${base_dur:-}" "${decode_tps_val:-}" > "jobs/$job/run-settings.txt"
-        printf 'think_budget=%s\nanswer_tokens=%s\n' "$THINK_BUDGET" "$ANSWER_TOKENS" >> "jobs/$job/run-settings.txt"
+        printf 'max_dur_scale=%s\nmax_dur_base=%s\ndecode_tps=%s\nbackstop_mult=%s\n' \
+            "$dur_scale" "${base_dur:-}" "${decode_tps_val:-}" "$BACKSTOP_MULT" > "jobs/$job/run-settings.txt"
+        printf 'think_budget=%s\nanswer_tokens=%s\ntemperature=%s\n' "$THINK_BUDGET" "$ANSWER_TOKENS" "$TEMPERATURE" >> "jobs/$job/run-settings.txt"
         [ "$agent" = claude-code ] && printf 'disallowed_tools=%s\nparallel_tools=%s\n' "$DISALLOWED_TOOLS" "$PARALLEL_TOOLS" >> "jobs/$job/run-settings.txt"
         proxy_pid=""   # global: the EXIT trap below stops it if we're interrupted
         if ! [[ "$agent" =~ ^(oracle|nop)$ ]]; then
             python3 ../lib/eval_proxy.py --port "$EVAL_PROXY_PORT" --upstream "$BASE_URL" \
                 ${server_model:+--model "$server_model"} \
                 --think-budget "$THINK_BUDGET" --answer-tokens "$ANSWER_TOKENS" \
+                ${TEMPERATURE:+--temperature "$TEMPERATURE"} \
+                $([ -f "jobs/$job/eval-settings.json" ] && echo --settings "jobs/$job/eval-settings.json") \
                 --log "jobs/$job/eval-proxy.tsv" > "jobs/$job/eval-proxy.out" 2>&1 &
             proxy_pid=$!
             local i
@@ -549,7 +636,7 @@ run)
             ( for _ in $(seq 60); do [ -d "jobs/$job" ] && break; sleep 1; done
               [ -d "jobs/$job" ] && printf '%s\n' "$srv_before" > "jobs/$job/server-settings.txt" ) &
         fi
-        "${HARBOR[@]}" run -y -a "$agent_spec" "${agent_args[@]}" \
+        "${HARBOR[@]}" run -y -a "$agent_spec" "${agent_args[@]}" "${hdr_args[@]}" \
             -n 1 -o jobs --job-name "$job" "$@" "${passthru[@]}" || rc=$?
         kill "$watch_pid" 2>/dev/null || true
         [ -z "$progress_pid" ] || kill "$progress_pid" 2>/dev/null || true
@@ -564,57 +651,64 @@ run)
         fi
     }
 
-    if [ "$MAX_DUR_SCALE" = auto ]; then
-        if [[ "$agent" =~ ^(oracle|nop)$ ]]; then MAX_DUR_SCALE=1
-        else
-            tps=$(decode_tps); decode_tps_val="$tps"
-            awk -v t="$tps" 'BEGIN { exit !(t > 0) }' || {
-                echo "ERROR: MAX_DUR_SCALE=auto couldn't measure decode speed; set MAX_DUR_SCALE=<number>" >&2; exit 1; }
-            MAX_DUR_SCALE=$(awk -v t="$tps" -v b="$AUTO_SCALE_BASE_TPS" 'BEGIN { s = b / t; if (s < 1) s = 1; printf "%.2f", s }')
-            echo "MAX_DUR_SCALE=auto: decode $tps tok/s vs $AUTO_SCALE_BASE_TPS baseline -> ${MAX_DUR_SCALE}x (min 1x)" >&2
-        fi
+    # time-limit scale for slower models (see MAX_DUR in the header); oracle/nop: 1x
+    decode_tps_val=""
+    if ! [[ "$agent" =~ ^(oracle|nop)$ ]]; then
+        tps=$(decode_tps); decode_tps_val="$tps"
+        awk -v t="$tps" 'BEGIN { exit !(t > 0) }' || {
+            echo "ERROR: couldn't measure the server's decode speed (needed to scale the time limits)" >&2; exit 1; }
+        dur_scale=$(awk -v t="$tps" -v b="$AUTO_SCALE_BASE_TPS" 'BEGIN { s = b / t; if (s < 1) s = 1; printf "%.2f", s }')
+        echo "time limits: decode $tps tok/s vs $AUTO_SCALE_BASE_TPS baseline -> ${dur_scale}x (min 1x)" >&2
     fi
 
-    # Every (dataset, time limit) group goes into ONE Harbor job. Harbor applies a single
+    # Every (dataset, limit, budget) group goes into ONE Harbor job. Per-task budgets reach
+    # the eval proxy through jobs/<job>/eval-settings.json (it matches each session to its
+    # task by the instruction text), so they don't split jobs. Harbor applies a single
     # timeout multiplier per job, so a task whose limit differs from its task.toml runs
-    # from a copy with the limit written in: tasks/_dur/<secs>/<same task name> (same
-    # name, so collect.py / SKIP_EXISTING see the same task; both read the limit from
-    # the task.toml a trial actually ran). The job gets a generated config listing each
-    # task path once per attempt to run, so per-task attempt counts (SKIP_EXISTING) fit too.
+    # from a copy with the limit written in: tasks/_dur/<secs>/ (failing limit) or
+    # tasks/_backstop/<secs>-b<budget>/ (budget-limited row; always a copy, so the path
+    # says which kind), same task name, so collect.py / SKIP_EXISTING see the same task;
+    # both read the limit -- and job_settings.timeout_mode the kind -- from the task copy a
+    # trial actually ran. The job gets a generated config listing each task path once per
+    # attempt to run, so per-task attempt counts (SKIP_EXISTING) fit too.
     rc=0
     task_paths=()   # one entry per trial to run
     names=()        # distinct task names, for the job name
     base_durs=()
-    variant() {     # variant <task dir> <secs> -> path of a copy whose agent timeout is <secs>
-        local src="$1" secs="$2" dst
-        if [ "$(awk '/^\[agent\]/{a=1;next} /^\[/{a=0} a && /^timeout_sec/{print int($3); exit}' "$src/task.toml")" = "$secs" ]; then
+    settings=()     # "<task name>\t<budget>\t<instruction.md of the copy it runs>"
+    variant() {     # variant <task dir> <secs> <fail|backstop> <budget> -> path of the copy to run
+        local src="$1" secs="$2" mode="$3" budget="$4" dst
+        if [ "$mode" = fail ] && [ "$(awk '/^\[agent\]/{a=1;next} /^\[/{a=0} a && /^timeout_sec/{print int($3); exit}' "$src/task.toml")" = "$secs" ]; then
             echo "$PWD/$src"; return
         fi
-        dst="tasks/_dur/$secs/$(basename "$src")"
+        if [ "$mode" = backstop ]; then dst="tasks/_backstop/$secs-b$budget/$(basename "$src")"
+        else dst="tasks/_dur/$secs/$(basename "$src")"; fi
         mkdir -p "$dst"
         rsync -a --delete "$src/" "$dst/"
         awk -v t="$secs" '/^\[/{a=($0=="[agent]")} a && /^timeout_sec/{$0="timeout_sec = " t ".0"} {print}' \
             "$src/task.toml" > "$dst/task.toml"
-        # instructions that state the limit (tb2_tc) get the copy's limit
-        sed -i -E "s/^Your time limit is [0-9]+ minutes;/Your time limit is $(( (secs + 30) / 60 )) minutes;/" \
-            "$dst/instruction.md"
+        # instructions that state the limit (tb2_tc) get the copy's limit, or its budget
+        [ ! -f "$dst/instruction.md" ] || python3 job_settings.py instruction "$dst/instruction.md" "$mode" "$secs" "$budget"
         echo "$PWD/$dst"
     }
+    add_task() {    # add_task <task name> <path> <budget> <attempts>
+        local i
+        names+=("$1"); settings+=("$1"$'\t'"$3"$'\t'"$2/instruction.md")
+        for ((i = 0; i < $4; i++)); do task_paths+=("$2"); done
+    }
     for key in "${!groups[@]}"; do
-        ds="${key%%|*}"; dur="${key#*|}"; [ "$dur" = "-" ] && dur="$MAX_DUR"
-        # scale every limit (an unset one = the task default) for slower models
-        base_dur="${dur:-$base_timeout}"; base_durs+=("$base_dur")
-        if [ "$MAX_DUR_SCALE" != 1 ]; then
-            dur=$(awk -v d="${dur:-$base_timeout}" -v s="$MAX_DUR_SCALE" 'BEGIN { printf "%.0f", d * s }')
-        fi
+        resolve_group "$key" "$dur_scale" "$decode_tps_val"
+        ds="$g_ds"
+        base_durs+=("${g_base:--}")
         globs=()
         while IFS= read -r glob; do [ -n "$glob" ] && globs+=("$glob"); done <<<"${groups[$key]}"
         globs+=("${cli_globs[@]}")
         [ ${#globs[@]} -gt 0 ] || globs=("*")
+        [ "$g_mode" = backstop ] && echo "budget ${g_budget} tokens, backstop time limit ${g_secs}s: ${globs[*]}" >&2
 
         if [ "${SKIP_EXISTING:-0}" != 1 ]; then
             while IFS= read -r t; do
-                task_paths+=("$(variant "$ds/$t" "${dur:-$base_timeout}")"); names+=("$t")
+                add_task "$t" "$(variant "$ds/$t" "$g_secs" "$g_mode" "$g_budget")" "$g_budget" 1
             done < <(cd "$ds" && for g in "${globs[@]}"; do compgen -G "$g" || true; done | sort -u)
             continue
         fi
@@ -626,21 +720,33 @@ run)
                 continue
             fi
             [ "$have_n" -gt 0 ] && echo "SKIP_EXISTING: $task has $have_n of $want_k (in ${have_jobs}); running $remaining more" >&2
-            p=$(variant "$ds/$task" "${dur:-$base_timeout}"); names+=("$task")
-            for ((i = 0; i < remaining; i++)); do task_paths+=("$p"); done
+            add_task "$task" "$(variant "$ds/$task" "$g_secs" "$g_mode" "$g_budget")" "$g_budget" "$remaining"
         done < <(python3 skip_existing.py --jobs jobs --dataset "$ds" --agent "$agent" ${CC_VERSION:+--agent-version "$CC_VERSION"} \
-                    --budget "$BUDGET" --think-budget "$THINK_BUDGET" --max-dur "${dur:-$base_timeout}" --max-dur-base "$base_dur" --k "$want_k" --server "$srv_file" "${globs[@]}")
+                    --budget "$g_budget" --think-budget "$THINK_BUDGET" --temperature "$TEMPERATURE" --max-dur "$g_secs" --max-dur-base "$g_base" \
+                    --timeout-mode "$g_mode" --k "$want_k" --server "$srv_file" "${globs[@]}")
         [ $skipped -gt 0 ] && echo "SKIP_EXISTING: skipped $skipped task(s) in $ds (listed above)" >&2
     done
     if [ ${#task_paths[@]} -eq 0 ]; then
         echo "nothing to run" >&2
     else
-        # one base limit for the whole run -> run-settings.txt; mixed = blank (collect.py derives it)
-        base_dur=$(printf '%s\n' "${base_durs[@]}" | sort -u); [[ "$base_dur" == *$'\n'* ]] && base_dur=""
+        # job-wide header = BUDGET (fallback for a session the proxy can't match to a task);
+        # the name says the budget if every task has the same one, else -bvar
+        budget_args "$BUDGET"
+        budgets=$(printf '%s\n' "${settings[@]}" | cut -f2 | sort -u)
+        tail_part="${tail_part%%-b*}"
+        if [[ "$budgets" == *$'\n'* ]]; then tail_part+="-bvar"
+        elif [ "$budgets" -gt 0 ]; then tail_part+="-b$(( budgets >= 1000 ? budgets / 1000 : budgets ))$([ "$budgets" -ge 1000 ] && echo k)"; fi
+        # one base limit for the whole run -> run-settings.txt; mixed or budget-limited = blank
+        # (collect.py derives it from the trial's own limit)
+        base_dur=$(printf '%s\n' "${base_durs[@]}" | sort -u); [[ "$base_dur" == *$'\n'* || "$base_dur" = - ]] && base_dur=""
         job=$(job_name "" $(printf '%s\n' "${names[@]}" | sort -u))
         mkdir -p "jobs/$job"
         printf '%s\n' "${task_paths[@]}" | python3 -c 'import json,sys; print(json.dumps({"tasks": [{"path": l.strip()} for l in sys.stdin if l.strip()]}, indent=1))' \
             > "jobs/$job/harbor-tasks.json"
+        printf '%s\n' "${settings[@]}" | sort -u | python3 -c 'import json,sys
+rows = [l.rstrip("\n").split("\t") for l in sys.stdin if l.strip()]
+print(json.dumps({"tasks": [{"name": n, "budget": int(b), "instruction": i} for n, b, i in rows]}, indent=1))' \
+            > "jobs/$job/eval-settings.json"
         echo "job $job: ${#task_paths[@]} trial(s) of $(printf '%s\n' "${names[@]}" | sort -u | wc -l) task(s)" >&2
         run_job "$job" -c "jobs/$job/harbor-tasks.json"
     fi

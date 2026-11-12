@@ -1225,6 +1225,9 @@ parse_fromfile_entries() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     stripped="${line%%#*}"
     stripped="$(echo "$stripped" | xargs)"
+    # key=value options (e.g. harbor.sh's budget=60k) are Harbor-only: drop them so they
+    # aren't taken for a positional tries/max_dur
+    stripped="$(printf '%s\n' $stripped | { grep -v '=' || true; } | xargs)"
     [[ -z "$stripped" ]] && continue
     read -r lang ex tries dur <<< "$stripped"
     # Emit "-" rather than "" for an unset tries/dur: tab is one of bash's

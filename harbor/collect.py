@@ -34,7 +34,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from job_settings import think_budget
+from job_settings import task_budgets, think_budget, timeout_mode
 
 # Commands the agent ran, classified by intent. Matched against the shell
 # command string of Bash-like tool calls (claude-code `command`, terminus-2
@@ -50,6 +50,7 @@ BUILD_RE = re.compile(
 # fields, or a final message that is an unparsed tool call (ends the episode).
 MARKUP_RE = re.compile(r"<tool_call>|<function[=>]|<parameter[=>]|INVOKE_MARKER|<invoke\b")
 EXIT_RE = re.compile(r"\[exit_code\] (-?\d+)")
+BASH_EXIT_RE = re.compile(r"\[exit_code\] (-?\d+)|Exit code (-?\d+)")
 FAIL_OUTPUT_RE = re.compile(
     r"\bFAILED\b|\bFAIL\b|Traceback \(most recent|error(\[E\d+\])?:|Error:|BUILD FAILED|"
     r"panic:|Segmentation fault|SyntaxError"
@@ -102,7 +103,7 @@ PARSE_ERROR_RE = re.compile(r"No valid JSON object found|Please fix these issues
 
 COLUMNS = [
     "job", "started_at", "agent", "agent_version", "model", "task", "language", "exercise",
-    "trial", "invalid", "check", "max_dur", "max_dur_scale", "max_dur_base", "disallowed_tools", "budget", "budget_hit", "reward", "tests_passed", "tests_total", "tests_total_oracle", "tests_frac",
+    "trial", "invalid", "check", "max_dur", "timeout_mode", "max_dur_scale", "max_dur_base", "disallowed_tools", "budget", "budget_hit", "reward", "tests_passed", "tests_total", "tests_total_oracle", "tests_frac",
     "tests_frac_adj", "tests_parsed",
     "test_limit", "test_calls", "test_limit_hit", "first_pass_call",
     "prog_samples", "prog_first_pass_sec", "prog_best_frac", "prog_last_frac",
@@ -111,13 +112,15 @@ COLUMNS = [
     "agent_sec", "agent_sec_adj", "slow_lost_sec", "verifier_sec", "total_sec",
     "in_tokens", "cached_tokens", "out_tokens",
     "agent_steps", "tool_calls", "tool_errors", "malformed_calls", "markup_final",
+    "bash_nonzero", "bash_nonzero_per_step", "bash_streaks", "bash_streaks3",
     "recall_steps", "recall_first_step", "recall_content", "fetch_source_calls", "fetch_source_ok", "net_calls",
     "instr_names_source",
     "thinking_blocks", "thinking_cutoffs", "thinking_cutoff_source", "final_turn_cutoff", "final_no_action",
     "think_chars", "think_code_chars", "big_writes", "writes_from_think", "think_spills",
-    "loop_blocks", "loop_unrecovered",
+    "loop_blocks", "loop_unrecovered", "phantom_prompts", "compactions", "ctx_drops", "ctx_max", "ctx_last", "ctx_mean",
     "px_requests", "px_rejected", "px_output_tokens", "px_reasoning_tokens", "px_answer_tokens",
-    "px_budget_cutoffs", "px_effort", "px_reasoning_budget", "px_model_sec", "px_slow_requests",
+    "px_budget_cutoffs", "px_budget_capped", "px_effort", "px_reasoning_budget", "px_model_sec", "px_infer_sec", "px_queue_sec",
+    "tool_sec", "px_slow_requests",
     "px_baseline_tok_s", "px_max_tokens",
     "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
     "own_tests", "own_test_files", "tools",
@@ -212,10 +215,37 @@ def recall_content(text: str) -> int:
     return 0
 
 
+def compaction_stats(tdir: Path) -> dict:
+    """compactions = Claude Code compact markers in the session jsonl (compact_boundary
+    entries / the "continued from a previous conversation" summary message);
+    ctx_drops = consecutive agent steps whose prompt_tokens fell >40% from >8k
+    (fallback signal: also fires on tool-result trimming, so check the marker count)."""
+    out = {"compactions": 0, "ctx_drops": 0, "ctx_max": "", "ctx_last": "", "ctx_mean": ""}
+    for f in (tdir / "agent" / "sessions").rglob("*.jsonl"):
+        for line in f.read_text(errors="replace").splitlines():
+            if '"compact_boundary"' in line or '"isCompactSummary":true' in line or "This session is being continued from a previous conversation" in line[:2000]:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("subtype") == "compact_boundary" or d.get("isCompactSummary") or d.get("type") == "user":
+                    out["compactions"] += 1
+    try:
+        steps = json.loads((tdir / "agent" / "trajectory.json").read_text()).get("steps", [])
+    except (OSError, ValueError):
+        return out
+    pt = [m["prompt_tokens"] for st in steps if (m := st.get("metrics")) and m.get("prompt_tokens")]
+    if pt:
+        # context size = each request's full input (prompt_tokens); max = peak, last = at the end
+        out["ctx_max"], out["ctx_last"], out["ctx_mean"] = max(pt), pt[-1], round(sum(pt) / len(pt))
+    out["ctx_drops"] = sum(a > 8000 and b < a * 0.6 for a, b in zip(pt, pt[1:]))
+    return out
+
+
 def trajectory_stats(path: Path, expected: frozenset = frozenset()) -> dict:
     s = dict.fromkeys(
         ["agent_steps", "tool_calls", "tool_errors", "malformed_calls", "markup_final",
-         "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
+         "bash_nonzero", "bash_nonzero_per_step", "bash_streaks", "bash_streaks3", "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
          "recall_steps", "recall_content", "fetch_source_calls", "fetch_source_ok", "net_calls",
          "own_tests"], 0)
     s["tools"] = ""
@@ -226,6 +256,7 @@ def trajectory_stats(path: Path, expected: frozenset = frozenset()) -> dict:
     traj = json.loads(path.read_text())
     tools: dict[str, int] = {}
     last_agent_msg = ""
+    shell_run = 0                          # current run of consecutive non-zero shell calls
     own_text: list[str] = []
     seen: set[str] = set()                 # paths the agent has read or edited: already existed
     created: dict[str, bool] = {}          # created code file -> implicitly run by its toolchain
@@ -263,6 +294,19 @@ def trajectory_stats(path: Path, expected: frozenset = frozenset()) -> dict:
                 # missing file or permission
                 if name not in SHELL_TOOLS or BASH_USAGE_RE.search(content):
                     s["tool_errors"] += 1
+            if name in SHELL_TOOLS and res:
+                # behaviour to watch, not good/bad: shell calls whose command exited non-zero
+                m = BASH_EXIT_RE.search(content)
+                nz = bool(m and int(m.group(1) or m.group(2)) != 0)
+                s["bash_nonzero"] += nz
+                if nz:
+                    shell_run += 1
+                    if shell_run == 1:      # a streak = a run of 1+ non-zero shell calls in a row
+                        s["bash_streaks"] += 1
+                    if shell_run == 3:      # bash_streaks3 = those that reached 3
+                        s["bash_streaks3"] += 1
+                else:
+                    shell_run = 0
             if MARKUP_RE.search(text_of(args)) or "InputValidationError" in content:
                 s["malformed_calls"] += 1
             if name in EDIT_TOOLS:
@@ -314,6 +358,7 @@ def trajectory_stats(path: Path, expected: frozenset = frozenset()) -> dict:
     mine = [p.rsplit("/", 1)[-1] for p, implicit in created.items() if implicit or (p in ran and TESTISH_NAME_RE.search(p.rsplit("/", 1)[-1]))]
     s["own_tests"] = len(mine) + impl_blocks
     s["own_test_files"] = ",".join(dict.fromkeys(mine + ["(test block in task file)"] * (impl_blocks > 0)))
+    s["bash_nonzero_per_step"] = round(s["bash_nonzero"] / s["agent_steps"], 3) if s["agent_steps"] else ""
     s["markup_final"] = int(bool(MARKUP_RE.search(last_agent_msg)))
     s["recall_content"] = recall_content("\n".join(own_text))
     s["tools"] = ",".join(f"{k}:{v}" for k, v in sorted(tools.items(), key=lambda kv: -kv[1]))
@@ -347,6 +392,12 @@ COPY_FRAC = 0.8
 # last 30 lines are lines seen 3+ times there), i.e. it repeated until a token cap
 LOOP_REPEATS = 5
 LOOP_TAIL = 30
+# a leaked training template mid-session: the model decides it got only a setup prompt
+# with no task ("the user hasn't asked a question yet"), often quoting a system prompt /
+# "audit" tool it was never given. Usually still makes its tool call (tokens wasted).
+PHANTOM_PROMPT = re.compile(
+    r"hasn'?t asked (a|any|anything)|no actual (task|question|request)|Understood\. I will follow these"
+    r"|Helps? user (to )?solve problems|nothing to act on|wait for the actual (task|request|question)", re.I)
 
 
 def sig_lines(text: str) -> list[str]:
@@ -375,7 +426,7 @@ def thinking_stats(agent_dir: Path) -> dict:
     text / tool input), and blocks that looped (and whether they ended still looping)."""
     keys = ["thinking_blocks", "thinking_cutoffs", "final_turn_cutoff", "final_no_action",
             "think_chars", "think_code_chars", "big_writes", "writes_from_think", "think_spills",
-            "loop_blocks", "loop_unrecovered",
+            "loop_blocks", "loop_unrecovered", "phantom_prompts",
             "_cut_marker", "_cut_est", "_final_cut_est"]
     log = agent_dir / "claude-code.txt"
     if not log.exists():
@@ -409,6 +460,7 @@ def thinking_stats(agent_dir: Path) -> dict:
                 looped, stuck = loop_info(body)
                 s["loop_blocks"] += looped
                 s["loop_unrecovered"] += stuck
+                s["phantom_prompts"] += bool(PHANTOM_PROMPT.search(body))
             if ty == "text" and ("</think>" in (body or "") or "<think>" in (body or "")):
                 s["think_spills"] += 1
             if ty == "tool_use":
@@ -439,6 +491,37 @@ def proxy_rows(job_dir: Path) -> list[dict]:
         return []
     with f.open(newline="") as fh:
         return list(csv.DictReader(fh, delimiter="\t"))
+
+
+# Strata arms min(requested budget, 75% of max_tokens) as the thinking budget, leaving the
+# rest for the answer. The proxy clamps max_tokens to the trial's remaining token budget, so
+# late requests get a smaller cap than the logged (requested) reasoning_budget.
+STRATA_THINK_FRAC = 0.75
+
+
+def effective_budgets(rows: list[dict], strata: bool) -> None:
+    """Fills reasoning_budget_eff (the thinking cap actually armed) and recomputes budget_cutoff
+    against it, in place. Proxies since the column existed log what Strata reported; for older
+    Strata rows it is re-derived from max_tokens_sent (`_eff_source` = "derived"). Strata
+    used to report the armed budget as null when the cap fired, so a blank logged value on a
+    Strata row is derived too."""
+    for r in rows:
+        rb, mx = r.get("reasoning_budget") or "", r.get("max_tokens_sent") or ""
+        if not rb.isdigit():
+            continue
+        logged = r.get("reasoning_budget_eff") or ""
+        if logged.isdigit():
+            eff, src = int(logged), "logged"
+        elif strata and mx.isdigit():
+            eff, src = min(int(rb), round(STRATA_THINK_FRAC * int(mx))), "derived"
+        else:
+            eff, src = int(rb), "requested"
+        r["reasoning_budget_eff"], r["_eff_source"] = str(eff), src
+        rt = r.get("reasoning_tokens") or ""
+        if rt.isdigit() and eff > 0:
+            # derived caps can be off by a rounding token; the injected cut-off line pushes a
+            # real cut past the cap anyway
+            r["budget_cutoff"] = str(int(int(rt) >= eff - (1 if src == "derived" else 0)))
 
 
 # A request is "unreasonably slow" when it produced >= SLOW_MIN_TOKENS but ran under
@@ -541,13 +624,21 @@ def proxy_stats(tdir: Path, rows: list[dict]) -> dict:
     session uuid (= its session file name under agent/sessions), terminus-2's
     X-Eval-Session (starts with the trial name)."""
     keys = ["px_requests", "px_rejected", "px_output_tokens", "px_reasoning_tokens", "px_answer_tokens",
-            "px_budget_cutoffs", "px_effort", "px_reasoning_budget", "px_model_sec", "px_slow_requests",
-            "px_baseline_tok_s", "slow_lost_sec", "px_max_tokens"]
+            "px_budget_cutoffs", "px_budget_capped", "px_effort", "px_reasoning_budget", "px_model_sec", "px_slow_requests",
+            "px_baseline_tok_s", "slow_lost_sec", "px_max_tokens", "px_infer_sec", "px_queue_sec"]
     if not rows:
         return dict.fromkeys(keys, "")
     mine = trial_proxy_rows(tdir, rows)
     done = [r for r in mine if r.get("note") != "rejected"]
     uniq = lambda k: ",".join(sorted({r[k] for r in done if r.get(k)}))
+    # px_model_sec = request wall time (queue + prompt processing + generation). The split
+    # needs the server's own compute times (srv_prompt_ms / srv_predicted_ms, llama.cpp-style
+    # "timings"); only when every request has them, else both stay blank (unknown)
+    timed = bool(done) and all((r.get("srv_prompt_ms") or "").isdigit() and (r.get("srv_predicted_ms") or "").isdigit()
+                               for r in done)
+    infer = sum(num(r, "srv_prompt_ms") + num(r, "srv_predicted_ms") for r in done) / 1000 if timed else None
+    queue = sum(max(0, num(r, "duration_ms") - num(r, "srv_prompt_ms") - num(r, "srv_predicted_ms"))
+                for r in done) / 1000 if timed else None
     return {
         "px_requests": len(done),
         "px_rejected": len(mine) - len(done),
@@ -555,9 +646,14 @@ def proxy_stats(tdir: Path, rows: list[dict]) -> dict:
         "px_reasoning_tokens": sum(num(r, "reasoning_tokens") for r in done),
         "px_answer_tokens": sum(num(r, "answer_tokens") for r in done),
         "px_budget_cutoffs": sum(num(r, "budget_cutoff") for r in done),
+        # requests whose armed thinking cap was below the requested budget (max_tokens clamp)
+        "px_budget_capped": sum(num(r, "reasoning_budget_eff") < num(r, "reasoning_budget")
+                                for r in done if (r.get("reasoning_budget_eff") or "").isdigit()),
         "px_effort": uniq("effort"),
         "px_reasoning_budget": uniq("reasoning_budget"),
         "px_model_sec": round(sum(num(r, "duration_ms") for r in done) / 1000),
+        "px_infer_sec": round(infer) if infer is not None else "",
+        "px_queue_sec": round(queue) if queue is not None else "",
         "px_max_tokens": sum(r.get("stop_reason") == "max_tokens" for r in done),
         **slow_stats(done, job_baseline_tok_s(rows)),
     }
@@ -689,6 +785,7 @@ def main() -> None:
     # agent time limit: the task's own timeout x --agent-timeout-multiplier (Harbor
     # leaves defaults out of config.json, hence the fallbacks)
     job_budget: dict[str, int] = {}
+    tb_cache: dict[str, dict[str, int]] = {}   # job -> per-task budgets
     px_cache: dict[str, list[dict]] = {}   # job -> eval-proxy.tsv rows
     job_mult: dict[str, float] = {}
     for cfg in a.jobs_dir.glob("*/config.json"):
@@ -749,7 +846,14 @@ def main() -> None:
             rw = {**rw, **rescored}
         passed, total = rw.get("tests_passed"), rw.get("tests_total")
         denom = max(total or 0, o_total or 0)
-        budget = job_budget.get(tdir.parent.name, 0)
+        # per-task budget (eval-settings.json) if the job has one, else the job-wide header
+        if tdir.parent.name not in tb_cache:
+            tb_cache[tdir.parent.name] = task_budgets(tdir.parent)
+        try:
+            tname = Path(json.loads((tdir / "config.json").read_text())["task"]["path"]).name
+        except (OSError, KeyError, ValueError):
+            tname = ""
+        budget = tb_cache[tdir.parent.name].get(tname, job_budget.get(tdir.parent.name, 0))
         exc = d.get("exception_info") or {}
         out_tok = ar.get("n_output_tokens") or 0
         row = {
@@ -789,10 +893,13 @@ def main() -> None:
             "out_tokens": ar.get("n_output_tokens", ""),
         }
         row.update(trajectory_stats(tdir / "agent" / "trajectory.json", frozenset(expected_files(tdir))))
+        row.update(compaction_stats(tdir))
         row.update(thinking_stats(tdir / "agent"))
         row["instr_names_source"] = int(bool(RECALL_RE.search(instr_text(tdir))))
         if tdir.parent.name not in px_cache:
             px_cache[tdir.parent.name] = proxy_rows(tdir.parent)
+            effective_budgets(px_cache[tdir.parent.name],
+                              job_srv.get(tdir.parent.name, {}).get("srv.target") == "strata")
         row.update(proxy_stats(tdir, px_cache[tdir.parent.name]))
         # thinking cut-offs, best source first: the proxy (Strata reports reasoning tokens
         # and the budget per request: tokens >= budget), Strata's cut-off marker line, else
@@ -825,9 +932,28 @@ def main() -> None:
             row["post_pass_out_tokens"] = max(0, tot_out - first["out_tokens_before"])
             row["post_pass_frac"] = round(row["post_pass_out_tokens"] / tot_out, 3) if tot_out else ""
         row["_progress"] = pts
+        # one row per completed request's reasoning length -> harbor-requests.tsv
+        row["_reqs"] = [r for r in trial_proxy_rows(tdir, px_cache[tdir.parent.name])
+                        if (r.get("reasoning_tokens") or "").isdigit() and (r.get("output_tokens") or "").isdigit()]
         # server slowdowns: a timed-out trial that lost time to them is invalid (the limit
         # was eaten by the server, not the model); a finished one gets its agent time
         # corrected instead
+        # agent time outside model requests: tool runs (tests, builds) + agent overhead
+        try:
+            row["tool_sec"] = (max(0, round(float(row["agent_sec"]) - row["px_model_sec"]))
+                               if row.get("px_model_sec") != "" and row.get("px_requests") else "")
+        except (TypeError, ValueError):
+            row["tool_sec"] = ""
+        try:
+            row["timeout_mode"] = timeout_mode(json.loads((tdir / "config.json").read_text())["task"]["path"])
+        except (OSError, KeyError, ValueError):
+            row["timeout_mode"] = "fail"
+        # token-budget rows: the time limit is only a stuck-trial safety net, so hitting it
+        # says nothing about the model -> harness failure (SKIP_EXISTING reruns it)
+        if row["timeout_mode"] == "backstop" and row["exception"] == "AgentTimeoutError" and not row["invalid"]:
+            reason = f"auto: hit the backstop time limit ({row['max_dur']}s) -- harness failure, not a model result"
+            (tdir / "INVALID").write_text(reason + "\n")
+            row["invalid"] = reason
         lost = row.get("slow_lost_sec") or 0
         if lost and row["exception"] == "AgentTimeoutError" and not row["invalid"]:
             reason = (f"auto: agent timeout after {row['px_slow_requests']} server-slowed request(s) "
@@ -883,6 +1009,23 @@ def main() -> None:
                 w.writerow({**{k: r[k] for k in PROGRESS_COLUMNS[:7]}, **p})
                 n += 1
     print(f"{n} progress points -> {prog_out}")
+    # one row per completed model request (model trials only): how long it reasoned, under
+    # which cap, and whether the cap cut it off -- the viz's reasoning-length spread
+    req_out = a.out.with_name("harbor-requests" + a.out.suffix)
+    with req_out.open("w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["job", "trial", "effort", "reasoning_budget", "reasoning_tokens", "answer_tokens",
+                    "output_tokens", "budget_cutoff", "reasoning_budget_eff"])
+        n = 0
+        for r in rows:
+            if r["check"]:
+                continue
+            for q in r["_reqs"]:
+                w.writerow([r["job"], r["trial"], q.get("effort", ""), q.get("reasoning_budget", ""),
+                            num(q, "reasoning_tokens"), num(q, "answer_tokens"), num(q, "output_tokens"),
+                            num(q, "budget_cutoff"), q.get("reasoning_budget_eff", "")])
+                n += 1
+    print(f"{n} requests -> {req_out}")
     # rebuild the viz whenever the TSVs change (run.sh's refresh_viz does the same after
     # aider runs); VIZ_REFRESH=0 skips it. A failed rebuild is a warning, not a collect failure.
     gen = a.out.parent / "viz" / "generate_viz_data.py"
