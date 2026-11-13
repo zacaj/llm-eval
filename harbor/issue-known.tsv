@@ -1,0 +1,6 @@
+# Resolved harness alerts: <python regex on the alert signature> TAB <verdict>.
+# Matching alerts stay in results/harness-alerts.tsv (with the verdict) but stop showing as open.
+^leak: personal CLAUDE\.md tool	fixed ~10-30: personal CLAUDE.md _ro tools leaked into the agent system prompt; proxy filter now strips it
+^env gap: missing common tool.* \| (xxd|file|unzip)$	added to polyglot + tb2 images 2026-11-12, tasks regenerated
+^env gap: missing common tool.* \| python$	python alias added to polyglot image 2026-11-12
+^env gap: missing common tool.* \| python3$	added to tb2 images (if absent) 2026-11-12

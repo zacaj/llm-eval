@@ -12,7 +12,7 @@ with what's under jobs/.
 Sources per trial:
   result.json             reward + test counts (from the forked verifier's
                           reward.json), tokens, timings, exception
-  agent/trajectory.json   ATIF steps -> tool calls, tool errors, malformed
+  agent/trajectory.json   ATIF steps -> tool calls, issue findings (issues.py), malformed
                           calls, build/test command runs, edits
 
 tests_total_oracle: a Go panic or C++ crash aborts the test binary, so the
@@ -50,15 +50,11 @@ BUILD_RE = re.compile(
 # fields, or a final message that is an unparsed tool call (ends the episode).
 MARKUP_RE = re.compile(r"<tool_call>|<function[=>]|<parameter[=>]|INVOKE_MARKER|<invoke\b")
 EXIT_RE = re.compile(r"\[exit_code\] (-?\d+)")
-BASH_EXIT_RE = re.compile(r"\[exit_code\] (-?\d+)|Exit code (-?\d+)")
 FAIL_OUTPUT_RE = re.compile(
     r"\bFAILED\b|\bFAIL\b|Traceback \(most recent|error(\[E\d+\])?:|Error:|BUILD FAILED|"
     r"panic:|Segmentation fault|SyntaxError"
 )
 SHELL_TOOLS = {"Bash", "bash", "execute_bash", "run_command", "shell"}
-# a shell result that says the command itself was wrong, not that the program it ran failed
-BASH_USAGE_RE = re.compile(r"Exit code 12[67]\b|command not found|syntax error near|unexpected EOF|Permission denied|"
-                           r"No such file or directory|cannot (?:open|access|stat)\b|: not found\b")
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "str_replace_editor", "write_file", "edit_file"}
 # terminus-2 has no edit tool: it writes files with heredocs/redirects. Source
 # files only, so scratch output like `> /tmp/out.txt` isn't an edit.
@@ -101,6 +97,8 @@ def expected_files(tdir: Path) -> set[str]:
 # the step has no tool calls, the complaint is in its observation.
 PARSE_ERROR_RE = re.compile(r"No valid JSON object found|Please fix these issues|No valid XML")
 
+from issues import ISSUE_COLUMNS, trial_issues, write_alerts  # docs/issue-taxonomy.md
+
 COLUMNS = [
     "job", "started_at", "agent", "agent_version", "model", "task", "language", "exercise",
     "trial", "invalid", "check", "max_dur", "timeout_mode", "max_dur_scale", "max_dur_base", "disallowed_tools", "budget", "budget_hit", "reward", "tests_passed", "tests_total", "tests_total_oracle", "tests_frac",
@@ -111,8 +109,8 @@ COLUMNS = [
     "exception",
     "agent_sec", "agent_sec_adj", "slow_lost_sec", "verifier_sec", "total_sec",
     "in_tokens", "cached_tokens", "out_tokens",
-    "agent_steps", "tool_calls", "tool_errors", "malformed_calls", "markup_final",
-    "bash_nonzero", "bash_nonzero_per_step", "bash_streaks", "bash_streaks3",
+    "agent_steps", "tool_calls", "malformed_calls", "markup_final",
+    *ISSUE_COLUMNS,
     "recall_steps", "recall_first_step", "recall_content", "fetch_source_calls", "fetch_source_ok", "net_calls",
     "instr_names_source",
     "thinking_blocks", "thinking_cutoffs", "thinking_cutoff_source", "final_turn_cutoff", "final_no_action",
@@ -122,7 +120,7 @@ COLUMNS = [
     "px_budget_cutoffs", "px_budget_capped", "px_effort", "px_reasoning_budget", "px_model_sec", "px_infer_sec", "px_queue_sec",
     "tool_sec", "px_slow_requests",
     "px_baseline_tok_s", "px_max_tokens",
-    "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
+    "edits", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
     "own_tests", "own_test_files", "tools",
 ]
 
@@ -244,8 +242,7 @@ def compaction_stats(tdir: Path) -> dict:
 
 def trajectory_stats(path: Path, expected: frozenset = frozenset()) -> dict:
     s = dict.fromkeys(
-        ["agent_steps", "tool_calls", "tool_errors", "malformed_calls", "markup_final",
-         "bash_nonzero", "bash_nonzero_per_step", "bash_streaks", "bash_streaks3", "edits", "edit_errors", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
+        ["agent_steps", "tool_calls", "malformed_calls", "markup_final", "edits", "test_runs", "test_fail_runs", "build_runs", "build_fail_runs",
          "recall_steps", "recall_content", "fetch_source_calls", "fetch_source_ok", "net_calls",
          "own_tests"], 0)
     s["tools"] = ""
@@ -256,7 +253,6 @@ def trajectory_stats(path: Path, expected: frozenset = frozenset()) -> dict:
     traj = json.loads(path.read_text())
     tools: dict[str, int] = {}
     last_agent_msg = ""
-    shell_run = 0                          # current run of consecutive non-zero shell calls
     own_text: list[str] = []
     seen: set[str] = set()                 # paths the agent has read or edited: already existed
     created: dict[str, bool] = {}          # created code file -> implicitly run by its toolchain
@@ -288,34 +284,11 @@ def trajectory_stats(path: Path, expected: frozenset = frozenset()) -> dict:
             tools[name] = tools.get(name, 0) + 1
             failed = bool(res) and result_failed(res)
             content = text_of(res.get("content")) if res else ""
-            if (res.get("extra") or {}).get("tool_result_is_error") and "InputValidationError" not in content:
-                # not a failing command (test/build runs are counted on their own): other
-                # tools' errors, and shell-level misuse -- exit 126/127, bad syntax,
-                # missing file or permission
-                if name not in SHELL_TOOLS or BASH_USAGE_RE.search(content):
-                    s["tool_errors"] += 1
-            if name in SHELL_TOOLS and res:
-                # behaviour to watch, not good/bad: shell calls whose command exited non-zero
-                m = BASH_EXIT_RE.search(content)
-                nz = bool(m and int(m.group(1) or m.group(2)) != 0)
-                s["bash_nonzero"] += nz
-                if nz:
-                    shell_run += 1
-                    if shell_run == 1:      # a streak = a run of 1+ non-zero shell calls in a row
-                        s["bash_streaks"] += 1
-                    if shell_run == 3:      # bash_streaks3 = those that reached 3
-                        s["bash_streaks3"] += 1
-                else:
-                    shell_run = 0
+            # failing tool calls are classified by harbor/issues.py (iss_* columns)
             if MARKUP_RE.search(text_of(args)) or "InputValidationError" in content:
                 s["malformed_calls"] += 1
             if name in EDIT_TOOLS:
                 s["edits"] += 1
-                # only the tool's own error flag: a successful edit's result quotes the
-                # edited code, and the output-text fallback in result_failed() read
-                # Rust's `Error::Variant` as a failure (rust forth: ~all edits "failed")
-                extra = (res.get("extra") or {}) if res else {}
-                s["edit_errors"] += bool(extra.get("tool_result_is_error") or extra.get("is_error"))
             cmd = command_of(args)
             fpath = str(args.get("file_path") or args.get("path") or "")
             base = fpath.rsplit("/", 1)[-1]
@@ -358,7 +331,6 @@ def trajectory_stats(path: Path, expected: frozenset = frozenset()) -> dict:
     mine = [p.rsplit("/", 1)[-1] for p, implicit in created.items() if implicit or (p in ran and TESTISH_NAME_RE.search(p.rsplit("/", 1)[-1]))]
     s["own_tests"] = len(mine) + impl_blocks
     s["own_test_files"] = ",".join(dict.fromkeys(mine + ["(test block in task file)"] * (impl_blocks > 0)))
-    s["bash_nonzero_per_step"] = round(s["bash_nonzero"] / s["agent_steps"], 3) if s["agent_steps"] else ""
     s["markup_final"] = int(bool(MARKUP_RE.search(last_agent_msg)))
     s["recall_content"] = recall_content("\n".join(own_text))
     s["tools"] = ",".join(f"{k}:{v}" for k, v in sorted(tools.items(), key=lambda kv: -kv[1]))
@@ -894,6 +866,18 @@ def main() -> None:
         }
         row.update(trajectory_stats(tdir / "agent" / "trajectory.json", frozenset(expected_files(tdir))))
         row.update(compaction_stats(tdir))
+        traj = tdir / "agent" / "trajectory.json"
+        row["_finds"] = []
+        if traj.exists():
+            try:
+                cols, finds = trial_issues(traj)
+            except (OSError, ValueError) as e:
+                print(f"issues: {traj}: {e}")
+                cols, finds = {}, []
+            row.update(cols)
+            for f in finds:
+                f["trial"], f["job"] = f"{tdir.parent.name}/{tdir.name}", tdir.parent.name
+            row["_finds"] = finds
         row.update(thinking_stats(tdir / "agent"))
         row["instr_names_source"] = int(bool(RECALL_RE.search(instr_text(tdir))))
         if tdir.parent.name not in px_cache:
@@ -996,6 +980,9 @@ def main() -> None:
             w.writeheader()
             w.writerows(sel)
         print(f"{len(sel)} trials -> {out}")
+    # findings no rule recognises / harness gaps (model trials only), see harbor/issues.py
+    write_alerts([f for r in rows if not r["check"] for f in r["_finds"]],
+                 a.out.with_name("harness-alerts" + a.out.suffix))
     # one row per mid-run test result (model trials only), see progress_points
     prog_out = a.out.with_name("harbor-progress" + a.out.suffix)
     with prog_out.open("w", newline="") as f:

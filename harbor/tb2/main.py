@@ -104,6 +104,12 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates sudo procps {' '.join(apt_pkgs)} \\
     && rm -rf /var/lib/apt/lists/* \\
     && rm -f /etc/dpkg/dpkg.cfg.d/excludes /etc/dpkg/dpkg.cfg.d/docker   # slim images: keep docs/man pages of later installs
+# common tools agents reach for unprompted (docs/issue-taxonomy.md env gaps); xxd is its own
+# package on newer Debian/Ubuntu, part of vim-common on older ones
+RUN apt-get update && apt-get install -y --no-install-recommends file unzip \\
+    && (apt-get install -y --no-install-recommends xxd || apt-get install -y --no-install-recommends vim-common) \\
+    && (command -v python3 >/dev/null || apt-get install -y --no-install-recommends python3) \\
+    && rm -rf /var/lib/apt/lists/*
 
 # pinned Claude Code, as polyglot-tc (Harbor skips its per-trial install when it matches)
 ARG CC_VERSION={cc_version()}

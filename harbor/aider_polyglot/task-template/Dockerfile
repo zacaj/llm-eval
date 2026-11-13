@@ -5,7 +5,13 @@ RUN apt-get update && apt-get install -y \
     tmux \
     asciinema \
     curl \
+    xxd file unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# (fork) agents reach for these unprompted; their absence showed up as command-not-found
+# in trajectories (docs/issue-taxonomy.md env gaps). `python` alias only where python3 exists.
+RUN if command -v python3 >/dev/null && ! command -v python >/dev/null; then \
+        ln -s "$(command -v python3)" /usr/local/bin/python; fi
 
 # (fork) Pre-install a pinned Claude Code (native build) so Harbor's per-trial agent
 # install is a no-op: it skips installing when `claude --version` already matches the
