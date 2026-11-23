@@ -115,7 +115,7 @@ COLUMNS = [
     "instr_names_source",
     "thinking_blocks", "thinking_cutoffs", "thinking_cutoff_source", "final_turn_cutoff", "final_no_action",
     "think_chars", "think_code_chars", "big_writes", "writes_from_think", "think_spills",
-    "loop_blocks", "loop_unrecovered", "phantom_prompts", "compactions", "ctx_drops", "ctx_max", "ctx_last", "ctx_mean",
+    "loop_blocks", "loop_unrecovered", "loop_max_repeats", "phantom_prompts", "compactions", "ctx_drops", "ctx_max", "ctx_last", "ctx_mean",
     "px_requests", "px_rejected", "px_output_tokens", "px_reasoning_tokens", "px_answer_tokens",
     "px_budget_cutoffs", "px_budget_capped", "px_effort", "px_reasoning_budget", "px_model_sec", "px_infer_sec", "px_queue_sec",
     "tool_sec", "px_slow_requests",
@@ -376,15 +376,28 @@ def sig_lines(text: str) -> list[str]:
     return [l.strip() for l in text.splitlines() if len(l.strip()) >= 12]
 
 
-def loop_info(text: str) -> tuple[bool, bool]:
+def loop_info(text: str) -> tuple[bool, bool, int, bool]:
+    """(looped, stuck, repeats of the most-repeated 3-line shingle, still_looping).
+    still_looping catches long-period loops the tail test misses (a 15-line cycle never
+    shows a line 3x in a 30-line tail): the top shingle, repeated LOOP_REPEATS+ times,
+    recurs within ~2 cycles of the end. It means stuck only if the block was also cut off
+    by the thinking cap -- settled in main() with the cut-off source."""
     lines = sig_lines(FENCED.sub("", text))
     if len(lines) < 3 * 3:
-        return False, False
-    shingles = Counter(tuple(lines[i:i + 3]) for i in range(len(lines) - 2))
+        return False, False, 0, False
+    pos: dict[tuple, list[int]] = {}
+    for i in range(len(lines) - 2):
+        pos.setdefault(tuple(lines[i:i + 3]), []).append(i)
+    top = max(pos.values(), key=len)
+    reps = len(top)
     tail = lines[-LOOP_TAIL:]
     tc = Counter(tail)
     stuck = sum(v for v in tc.values() if v >= 3) / len(tail) >= 0.5
-    return stuck or max(shingles.values()) >= LOOP_REPEATS, stuck
+    still = False
+    if reps >= LOOP_REPEATS:
+        period = (top[-1] - top[0]) / (reps - 1)
+        still = len(lines) - top[-1] <= 2 * period + 3
+    return stuck or reps >= LOOP_REPEATS, stuck, reps, still
 
 
 def thinking_stats(agent_dir: Path) -> dict:
@@ -398,8 +411,8 @@ def thinking_stats(agent_dir: Path) -> dict:
     text / tool input), and blocks that looped (and whether they ended still looping)."""
     keys = ["thinking_blocks", "thinking_cutoffs", "final_turn_cutoff", "final_no_action",
             "think_chars", "think_code_chars", "big_writes", "writes_from_think", "think_spills",
-            "loop_blocks", "loop_unrecovered", "phantom_prompts",
-            "_cut_marker", "_cut_est", "_final_cut_est"]
+            "loop_blocks", "loop_unrecovered", "loop_max_repeats", "phantom_prompts",
+            "_cut_marker", "_cut_est", "_final_cut_est", "_loop_cut_marker", "_loop_cut_est"]
     log = agent_dir / "claude-code.txt"
     if not log.exists():
         return dict.fromkeys(keys, "")
@@ -429,9 +442,14 @@ def thinking_stats(agent_dir: Path) -> dict:
                 s["think_code_chars"] += sum(len(m) for m in FENCED.findall(body or ""))
                 seen_think.update(sig_lines(body or ""))
             if body:
-                looped, stuck = loop_info(body)
+                looped, stuck, reps, still = loop_info(body)
                 s["loop_blocks"] += looped
                 s["loop_unrecovered"] += stuck
+                if still and not stuck:   # long-period loop that ran into the cap?
+                    s["_loop_cut_marker"] += cut(b)
+                    s["_loop_cut_est"] += est(b)
+                if looped:
+                    s["loop_max_repeats"] = max(s["loop_max_repeats"], reps)
                 s["phantom_prompts"] += bool(PHANTOM_PROMPT.search(body))
             if ty == "text" and ("</think>" in (body or "") or "<think>" in (body or "")):
                 s["think_spills"] += 1
@@ -895,12 +913,18 @@ def main() -> None:
         elif px_reasoned:
             row["thinking_cutoffs"] = row["px_budget_cutoffs"]
             row["thinking_cutoff_source"] = "proxy"
+            # proxy cut-offs are per request, not per block: trust the estimate's
+            # still-looping-at-the-cap blocks only up to the real cut-off count
+            row["loop_unrecovered"] += min(max(row["_loop_cut_marker"], row["_loop_cut_est"]),
+                                           int(row["px_budget_cutoffs"] or 0))
         elif row["_cut_marker"] or job_srv.get(tdir.parent.name, {}).get("srv.target") == "strata":
             row["thinking_cutoff_source"] = "marker"
+            row["loop_unrecovered"] += row["_loop_cut_marker"]
         else:
             row["thinking_cutoffs"] = row["_cut_est"]
             row["final_turn_cutoff"] = row["_final_cut_est"]
             row["thinking_cutoff_source"] = "length-est"
+            row["loop_unrecovered"] += row["_loop_cut_est"]
         # run-tests calls + side samples on a requests/tokens axis -> harbor-progress.tsv;
         # first_pass_* = the budget used when the code first passed every test
         pts = progress_points(tdir, d, trial_proxy_rows(tdir, px_cache[tdir.parent.name]), denom)
