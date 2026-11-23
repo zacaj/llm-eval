@@ -63,7 +63,7 @@ else
 fi
 echo
 if [ "$rc" -eq 0 ]; then
-    echo "Test run $n of $LIMIT: all $total tests passed."
+    echo "Test run $n of $LIMIT: all $total tests passed. No further runs are needed."
 elif [ "$total" -eq 0 ]; then
     echo "Test run $n of $LIMIT: FAILED (the tests did not run -- see errors above). Runs left: $((LIMIT - n))."
 else

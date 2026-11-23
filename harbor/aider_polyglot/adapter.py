@@ -524,9 +524,10 @@ RUN chown -R tester:tester /opt/hidden-tests && chmod 700 /opt/hidden-tests \\
         instr.write_text(instr.read_text(encoding="utf-8").rstrip("\n") + f"""
 
 You can check your solution against the hidden unit tests (you cannot read them) by
-running `run-tests` in a shell. You have {limit} test runs in total. After your
-{limit}th run your session ends immediately and your code is graded as it is at that
-moment. Each run's output is also saved to /var/lib/run-tests/run-<N>.txt.
+running `run-tests` in a shell, up to {limit} times. Using them is optional; once all
+tests pass, there is no need to run them again. Your session ends immediately after
+the {limit}th run (your code is graded as it is at that moment), so don't use up runs
+you don't need. Each run's output is also saved to /var/lib/run-tests/run-<N>.txt.
 """, encoding="utf-8")
 
         toml = output_dir / "task.toml"
