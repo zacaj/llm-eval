@@ -130,6 +130,7 @@ CLASSIC_DATASET=tasks/aider_polyglot
 TC_DATASET=tasks/aider_polyglot_tc
 TB2_DATASET=tasks/tb2
 TB2_TC_DATASET=tasks/tb2_tc
+TG_TC_DATASET=tasks/termgrade_tc   # TermGrade rows: harbor/termgrade/main.py, generated ahead (no src fallback)
 TB2_SRC="${TB2_SRC:-}"   # terminal-bench-2 checkout, only to generate a missing tb2_tc task
 TC="${TC:-}"
 DATASET_FORCED="${DATASET:-}"
@@ -201,8 +202,12 @@ list_entries() {
         done
         read -r lang ex tries dur <<<"${toks[*]}"
         [ -z "$lang" ] && continue
-        if [[ "$LANGS" != *" $lang "* && -d "$TB2_DATASET/$lang" ]]; then
-            # Terminal-Bench 2 row: <task> [calls] [max_dur]; calls -> tb2_tc/<task>__tc<calls>
+        local tc_ds="$TB2_TC_DATASET"
+        if [[ "$LANGS" != *" $lang "* ]] && compgen -G "$TG_TC_DATASET/${lang}__tc*" >/dev/null; then
+            tc_ds="$TG_TC_DATASET"   # TermGrade row: same shape, test-calls tasks only
+        fi
+        if [[ "$LANGS" != *" $lang "* ]] && { [ -d "$TB2_DATASET/$lang" ] || [ "$tc_ds" = "$TG_TC_DATASET" ]; }; then
+            # Terminal-Bench 2 / TermGrade row: <task> [calls] [max_dur]; calls -> <tc dataset>/<task>__tc<calls>
             local task="$lang" calls="$ex" tds="$TB2_DATASET" tglob="$lang" tdir
             dur="$tries"
             [[ "$calls" =~ ^[0-9]+$ ]] || { calls=""; dur="$ex"; }
@@ -210,10 +215,11 @@ list_entries() {
             if [ -n "$DATASET_FORCED" ]; then
                 tds="$DATASET_FORCED"
             elif [ "$TC" = 1 ] || { [ -z "$TC" ] && [ -n "$calls" ]; }; then
-                tds="$TB2_TC_DATASET"
+                tds="$tc_ds"
                 if [ -n "$calls" ]; then
                     tglob="${task}__tc$calls"
                     if [ ! -d "$tds/$tglob" ]; then
+                        [ "$tds" = "$TB2_TC_DATASET" ] || { echo "missing $tds/$tglob: generate it with termgrade/main.py" >&2; exit 1; }
                         [ -n "$TB2_SRC" ] || { echo "missing $tds/$tglob: set TB2_SRC=<terminal-bench-2 checkout> to generate it" >&2; exit 1; }
                         echo "generating missing test-calls task $tglob" >&2
                         python3 tb2/main.py --src "$TB2_SRC" --tasks "$task" --test-calls "$calls" >&2

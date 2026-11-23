@@ -1,0 +1,21 @@
+# TermGrade pilot set (huggingface ai-and/termgrade-environments; test-calls variants in
+# harbor/tasks/termgrade_tc, made by harbor/termgrade/main.py --src runs/termgrade-environments).
+# Format matches tb2.txt: <task>  [test_calls]  [budget=<tokens>]. Unlike TB2 rows, missing
+# tasks are not generated on demand.
+# Picked (2026-11-18) from the 802 `unseen` tasks by their per-test trial data:
+#   - no test that strong models (kimi/glm/deepseek) fail in most near-miss trials, no test
+#     nobody ever passes, no skips (filters out tests that contradict the instructions);
+#   - qwen3.6-27B pass@1 0.1-0.8 and qwen/gemma-4-31B mean test fraction 0.4-0.95.
+# Their numbers: Terminus-2, no test feedback, 12h cap, k=8 (qwen/gemma), passes binary.
+# Budgets = 1.5 x the largest passing qwen/gemma trial's output tokens there, rounded up, floor 30k.
+#
+# task                 calls  budget        # what            qwen  gemma  gem-think  kimi
+task_09326_0aab56      5      budget=40k    # build: fixed-point ledger, odd account names  .12  .50  .75  .88  [lower-tier] gyro-m 100% first call; LFM2.5-24B / 9B spread 0-1
+task_04204_b938f8      5      budget=50k    # build: binary TLV/varint decoder -> JSON      .50  .00  1.00  1.00  gyro-m all pass, 10-33k tokens to pass
+# --- harder set (2026-11-20, harbor/termgrade/select.py defaults: qwen & gemma pass@1 <= .25,
+# best strong model >= .75). Budget 50k flat: too few local passes there to size from. ---
+#                                                                                  qwen  gemma  gem-think  kimi  glm  deepseek
+task_00388_e8b0af      5      budget=50k    # build: write-ahead-log key-value store (/data)   0    0     0     1.00  1.00  0
+task_12989_6edd38      5      budget=50k    # build: semver range resolver, 35 tests          .12   0     0     .75  1.00  .50
+task_05853_421269      5      budget=50k    # build: UTF-8 log stream collator                  0   .12   .38    .88  1.00  1.00
+task_09343_155fc1      5      budget=50k    # build: config file merger                       .25   0    .25   1.00  1.00  1.00

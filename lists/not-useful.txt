@@ -20,3 +20,7 @@ constraints-scheduling          5      1200   # [saturated] [no-spread] all pass
 multi-source-data-merger        5      900    # [saturated] [no-spread] all pass, 6-11 requests; no model signal
 db-wal-recovery                 5      900    # [saturated] [noisy] 5k-48k tokens to pass, but same model ranges 5k-40k
 financial-document-processor    5      1200   # [saturated] [no-spread] all pass first call; weak token signal at best
+
+# --- TermGrade (lists/termgrade.txt) ---
+task_03695_7cc5b4      5      budget=40k    # [saturated] [no-spread] gyro-m 9/9 pass on run-tests call 1-2, 3-13k tokens, same-model range as wide
+task_02335_4a56fc      5      budget=40k    # [saturated] [no-spread] gyro-m 6/6 pass on call 1-2, 4-15k tokens

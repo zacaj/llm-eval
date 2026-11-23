@@ -4,6 +4,10 @@
 # Budgets (2026-11-05) = max(1.5 x p90, 1.1 x max) of output tokens to first pass over
 # earlier harbor trials, rounded up to 10k, floor 20k.
 
+# termgrade
+task_04204_b938f8      5      budget=50k    # build: binary TLV/varint decoder -> JSON      .50  .00  1.00  1.00
+
+
 # aider - mostly somewhat known but still give some good differentiatoin
 #javascript     zebra-puzzle              5  budget=25k   # max_dur 800; never recalled!
 javascript     scale-generator           4  budget=45k   # max_dur 600; known but not often

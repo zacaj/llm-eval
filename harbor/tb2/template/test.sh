@@ -9,7 +9,7 @@
 OUT="${OUT:-/logs/verifier}"
 TEST_DIR="${TEST_DIR:-/tests}"
 mkdir -p "$OUT"
-cd /app || exit 1
+cd @CWD@ || exit 1
 @PRE@
 repo_rc=0
 if [ @REPO_SUITE@ = 1 ]; then

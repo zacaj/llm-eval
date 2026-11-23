@@ -828,8 +828,9 @@ def main() -> None:
         mi = d["agent_info"].get("model_info") or {}
         task = d["task_name"]
         m = re.search(r"polyglot_([a-z]+)_(.+?)(?:__tc\d+)?$", task)
-        # other datasets (terminal-bench/<task>[__tc<N>]): language = dataset tag
-        m_tb = None if m else re.match(r"terminal-bench/(.+?)(?:__tc\d+)?$", task)
+        # other datasets (terminal-bench/<task>[__tc<N>], termgrade/<task>[__tc<N>]):
+        # language = dataset tag
+        m_tb = None if m else re.match(r"(terminal-bench|termgrade)/(.+?)(?:__tc\d+)?$", task)
         o_total = oracle_total.get(exercise_key(task))
         rescored = rescore(tdir, m.group(1) if m else "", rw, o_total)
         if rescored:
@@ -858,8 +859,8 @@ def main() -> None:
             "model": mi.get("name", ""),
             # drop polyglot's "<dataset>__" / other datasets' "<org>/"; tc tasks keep their "__tc<N>"
             "task": task.split("__", 1)[-1] if m else task.rsplit("/", 1)[-1],
-            "language": m.group(1) if m else ("tb2" if m_tb else ""),
-            "exercise": m.group(2) if m else (m_tb.group(1) if m_tb else ""),
+            "language": m.group(1) if m else ({"terminal-bench": "tb2"}.get(m_tb.group(1), m_tb.group(1)) if m_tb else ""),
+            "exercise": m.group(2) if m else (m_tb.group(2) if m_tb else ""),
             "trial": tdir.name,
             # <trial>/INVALID (first line = reason): trial ran under a known harness bug;
             # keep the row for the record but exclude it from comparisons
