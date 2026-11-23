@@ -33,7 +33,8 @@ from job_settings import LIMIT_LINE_RE, dur_scale, read_kv, task_budgets, think_
 # decoding knobs, change speed not outputs). Missing on both sides = match.
 SERVER_KEYS = re.compile(
     r"^srv\.(target|-m|--temp|--top-p|--top-k|--min-p|eff\..*|kv_cache|-ctk|-ctv|"
-    r"--reasoning-budget|logit_bias|proxy_filters|--chat-template-file)$"
+    r"--reasoning-budget|logit_bias|proxy_filters|--chat-template-file|"
+    r"--lora|--lora-scaled|--control-vector|--control-vector-scaled)$"
 )
 # the thinking cap is compared on its own (job_settings.think_budget, which collect.py /
 # the viz use too): newer jobs record it in run-settings.txt, not the server capture
